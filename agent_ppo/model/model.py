@@ -6,8 +6,8 @@
 """
 Author: Tencent AI Arena Authors
 
-Neural network model for Blank PPO.
-空白版 PPO 神经网络模型。
+Neural network model for Gorge Chase PPO.
+峡谷追猎 PPO 神经网络模型。
 """
 
 import torch
@@ -35,10 +35,9 @@ class Model(nn.Module):
 
     def __init__(self, device=None):
         super().__init__()
-        self.model_name = "blank_ppo"
+        self.model_name = "gorge_chase_cnn_attn"
         self.device = device
 
-        view_tokens = Config.VIEW_SIZE * Config.VIEW_SIZE
         token_dim = 64
         scalar_dim = Config.SCALAR_FEATURE_DIM
         trunk_dim = 128
@@ -72,13 +71,12 @@ class Model(nn.Module):
         # Critic head / 价值头
         self.critic_head = make_fc_layer(trunk_dim, value_num)
 
-        self.view_tokens = view_tokens
-
     def forward(self, obs, inference=False):
         batch_size = obs.shape[0]
+        view_flat_dim = Config.VIEW_CHANNELS * Config.VIEW_SIZE * Config.VIEW_SIZE
 
-        view_flat = obs[:, : Config.VIEW_CHANNELS * Config.VIEW_SIZE * Config.VIEW_SIZE]
-        scalar = obs[:, Config.VIEW_CHANNELS * Config.VIEW_SIZE * Config.VIEW_SIZE :]
+        view_flat = obs[:, :view_flat_dim]
+        scalar = obs[:, view_flat_dim:]
 
         view = view_flat.view(batch_size, Config.VIEW_CHANNELS, Config.VIEW_SIZE, Config.VIEW_SIZE)
         feat = self.cnn(view)

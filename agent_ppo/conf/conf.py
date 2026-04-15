@@ -6,13 +6,12 @@
 """
 Author: Tencent AI Arena Authors
 
-Configuration for Blank PPO (environment-agnostic starter template).
-空白版 PPO 配置（与环境无关的起步模板）。
+Configuration for Gorge Chase PPO.
+峡谷追猎 PPO 配置。
 """
 
 
 class Config:
-
     # Observation setting / 观测设置
     VIEW_SIZE = 21
     VIEW_CHANNELS = 4  # obstacle, treasure, monster, self
@@ -46,3 +45,9 @@ class Config:
     REWARD_ESCAPE_PROGRESS = 0.08
     REWARD_ESCAPE_DANGER_PENALTY = -0.04
     DANGER_DISTANCE = 3.0
+
+    # Extra light-weight rewards / 额外轻量奖励
+    REWARD_SAFE_BONUS = 0.003
+    REWARD_DANGER_ESCAPE_BONUS = 0.05
+    REWARD_STAGNATION_PENALTY = -0.01
+    STAGNATION_STEPS = 6

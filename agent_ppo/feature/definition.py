@@ -6,8 +6,8 @@
 """
 Author: Tencent AI Arena Authors
 
-Data definitions and GAE computation for Blank PPO.
-空白版 PPO 数据类定义与 GAE 计算。
+Data definitions, GAE computation for Gorge Chase PPO.
+峡谷追猎 PPO 数据类定义与 GAE 计算。
 """
 
 import numpy as np
@@ -15,13 +15,13 @@ from common_python.utils.common_func import create_cls, attached
 from agent_ppo.conf.conf import Config
 
 
-# ObsData: feature=1D placeholder, legal_action=ACTION_NUM mask / 占位特征与合法动作掩码
+# ObsData: feature=40D vector, legal_action=8D mask / 特征向量与合法动作掩码
 ObsData = create_cls("ObsData", feature=None, legal_action=None)
 
 # ActData: action, d_action(greedy), prob, value / 动作、贪心动作、概率、价值
 ActData = create_cls("ActData", action=None, d_action=None, prob=None, value=None)
 
-# SampleData: single-frame PPO sample / PPO 单帧样本
+# SampleData: single-frame sample with int dims / 单帧样本（整数表示维度）
 SampleData = create_cls(
     "SampleData",
     obs=Config.DIM_OF_OBSERVATION,

@@ -6,11 +6,12 @@
 """
 Author: Tencent AI Arena Authors
 
-Feature preprocessor and reward design for Blank PPO.
-空白版 PPO 特征预处理与奖励设计。
+Feature preprocessor and reward design for Gorge Chase PPO.
+峡谷追猎 PPO 特征预处理与奖励设计。
 """
 
 import numpy as np
+
 from agent_ppo.conf.conf import Config
 
 
@@ -19,14 +20,11 @@ class Preprocessor:
         self.reset()
 
     def reset(self):
-        """Reset per-episode state.
-
-        每局开始时重置状态。
-        """
         self.step_no = 0
         self.prev_treasure_dist = None
         self.prev_monster_dist = None
         self.prev_score = 0.0
+        self.stagnation_steps = 0
 
     def feature_process(self, env_obs, last_action):
         """Process env_obs into feature vector, legal_action mask, and reward.
@@ -35,20 +33,28 @@ class Preprocessor:
         """
         self.step_no += 1
 
+        observation = env_obs.get("observation", env_obs)
+        frame_state = observation.get("frame_state", {})
+        legal_act_raw = observation.get("legal_action", None)
+
         obstacle_map = self._extract_view_layer(
-            env_obs,
-            candidate_keys=["obstacle_map", "obstacle", "wall_map", "block_map", "obstacle_mask"],
+            observation,
+            frame_state,
+            candidate_keys=["obstacle_map", "obstacle", "wall_map", "block_map", "obstacle_mask", "map_info"],
         )
         treasure_map = self._extract_view_layer(
-            env_obs,
+            observation,
+            frame_state,
             candidate_keys=["treasure_map", "treasure", "chest_map", "chest", "treasure_mask"],
         )
         monster_map = self._extract_view_layer(
-            env_obs,
+            observation,
+            frame_state,
             candidate_keys=["monster_map", "monster", "enemy_map", "enemy", "threat_map"],
         )
         self_map = self._extract_view_layer(
-            env_obs,
+            observation,
+            frame_state,
             candidate_keys=["self_map", "agent_map", "player_map", "hero_map"],
         )
 
@@ -60,7 +66,7 @@ class Preprocessor:
 
         nearest_treasure_dist = self._nearest_distance_to_center(treasure_map)
         nearest_monster_dist = self._nearest_distance_to_center(monster_map)
-        reward_value = self._shape_reward(env_obs, nearest_treasure_dist, nearest_monster_dist)
+        reward_value = self._shape_reward(observation, nearest_treasure_dist, nearest_monster_dist)
 
         scalar_feature = self._build_scalar_feature(
             last_action=last_action,
@@ -71,12 +77,12 @@ class Preprocessor:
         )
 
         feature = np.concatenate([stacked_view.reshape(-1), scalar_feature], axis=0).astype(np.float32)
-        legal_action = self._extract_legal_action(env_obs)
+        legal_action = self._extract_legal_action(legal_act_raw)
         reward = [float(reward_value)]
 
         return feature, legal_action, reward
 
-    def _shape_reward(self, env_obs, nearest_treasure_dist, nearest_monster_dist):
+    def _shape_reward(self, observation, nearest_treasure_dist, nearest_monster_dist):
         reward = Config.REWARD_STEP_PENALTY
 
         if nearest_treasure_dist is not None and self.prev_treasure_dist is not None:
@@ -88,11 +94,35 @@ class Preprocessor:
         if nearest_monster_dist is not None and nearest_monster_dist <= Config.DANGER_DISTANCE:
             reward += Config.REWARD_ESCAPE_DANGER_PENALTY * (Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
 
-        score = float(self._scalar_from_obs(env_obs, ["score", "total_score", "game_score"], default=self.prev_score))
+        if nearest_monster_dist is not None and nearest_monster_dist > Config.DANGER_DISTANCE:
+            reward += Config.REWARD_SAFE_BONUS
+
+        if (
+            self.prev_monster_dist is not None
+            and self.prev_monster_dist <= Config.DANGER_DISTANCE
+            and nearest_monster_dist is not None
+            and nearest_monster_dist > Config.DANGER_DISTANCE
+        ):
+            reward += Config.REWARD_DANGER_ESCAPE_BONUS
+
+        score = float(self._scalar_from_obs(observation, ["score", "total_score", "game_score"], default=self.prev_score))
         score_delta = max(0.0, score - self.prev_score)
         if score_delta > 0:
             reward += Config.REWARD_TREASURE_PICKUP * score_delta
         self.prev_score = score
+
+        moved_on_target = False
+        if nearest_treasure_dist is not None and self.prev_treasure_dist is not None:
+            moved_on_target = abs(nearest_treasure_dist - self.prev_treasure_dist) > 1e-6
+        elif nearest_monster_dist is not None and self.prev_monster_dist is not None:
+            moved_on_target = abs(nearest_monster_dist - self.prev_monster_dist) > 1e-6
+
+        if moved_on_target:
+            self.stagnation_steps = 0
+        else:
+            self.stagnation_steps += 1
+            if self.stagnation_steps >= Config.STAGNATION_STEPS:
+                reward += Config.REWARD_STAGNATION_PENALTY
 
         self.prev_treasure_dist = nearest_treasure_dist
         self.prev_monster_dist = nearest_monster_dist
@@ -128,30 +158,28 @@ class Preprocessor:
         )
         return scalar
 
-    def _extract_legal_action(self, env_obs):
-        raw_mask = self._find_first(
-            env_obs,
-            [
-                "legal_action",
-                "legal_actions",
-                "action_mask",
-                "avail_actions",
-                "available_actions",
-            ],
-        )
-        if raw_mask is None:
+    def _extract_legal_action(self, legal_act_raw):
+        if legal_act_raw is None:
             return [1] * Config.ACTION_NUM
 
-        arr = np.asarray(raw_mask, dtype=np.float32).reshape(-1)
-        if arr.size < Config.ACTION_NUM:
+        arr = np.asarray(legal_act_raw, dtype=np.float32).reshape(-1)
+        if arr.size >= Config.ACTION_NUM:
+            if np.all((arr[: Config.ACTION_NUM] == 0) | (arr[: Config.ACTION_NUM] == 1)):
+                mask = arr[: Config.ACTION_NUM]
+            else:
+                valid_set = {int(a) for a in arr if 0 <= int(a) < Config.ACTION_NUM}
+                mask = np.array([1 if i in valid_set else 0 for i in range(Config.ACTION_NUM)], dtype=np.float32)
+        else:
             return [1] * Config.ACTION_NUM
-        mask = (arr[: Config.ACTION_NUM] > 0).astype(np.float32)
+
         if float(mask.sum()) <= 0:
             mask = np.ones(Config.ACTION_NUM, dtype=np.float32)
         return mask.tolist()
 
-    def _extract_view_layer(self, env_obs, candidate_keys):
-        raw = self._find_first(env_obs, candidate_keys)
+    def _extract_view_layer(self, observation, frame_state, candidate_keys):
+        raw = self._find_first(observation, candidate_keys)
+        if raw is None:
+            raw = self._find_first(frame_state, candidate_keys)
         if raw is None:
             return np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
 
@@ -194,7 +222,6 @@ class Preprocessor:
 
         cropped = arr[src_top:src_bottom, src_left:src_right]
         ch, cw = cropped.shape
-
         dst_top = max(0, (target_size - ch) // 2)
         dst_left = max(0, (target_size - cw) // 2)
         out[dst_top : dst_top + ch, dst_left : dst_left + cw] = cropped

@@ -6,8 +6,8 @@
 """
 Author: Tencent AI Arena Authors
 
-Agent class for Blank PPO (environment-agnostic starter template).
-空白版 PPO Agent 主类（与环境无关的起步模板）。
+Agent class for Gorge Chase PPO.
+峡谷追猎 PPO Agent 主类。
 """
 
 import torch

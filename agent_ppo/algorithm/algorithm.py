@@ -6,15 +6,15 @@
 """
 Author: Tencent AI Arena Authors
 
-PPO algorithm implementation for Blank PPO.
-空白版 PPO 算法实现。
+PPO algorithm implementation for Gorge Chase PPO.
+峡谷追猎 PPO 算法实现。
 
 损失组成：
   total_loss = vf_coef * value_loss + policy_loss - beta * entropy_loss
 
   - value_loss  : Clipped value function loss（裁剪价值函数损失）
   - policy_loss : PPO Clipped surrogate objective（PPO 裁剪替代目标）
-  - entropy_loss: Action entropy regularization（动作熵正则化）
+  - entropy_loss: Action entropy regularization（动作熵正则化，鼓励探索）
 """
 
 import os
@@ -47,16 +47,14 @@ class Algorithm:
 
         训练入口：对一批 SampleData 执行 PPO 更新。
         """
-        obs = torch.stack([f.obs for f in list_sample_data]).to(self.device).view(-1, Config.DIM_OF_OBSERVATION)
-        legal_action = (
-            torch.stack([f.legal_action for f in list_sample_data]).to(self.device).view(-1, Config.ACTION_NUM)
-        )
+        obs = torch.stack([f.obs for f in list_sample_data]).to(self.device)
+        legal_action = torch.stack([f.legal_action for f in list_sample_data]).to(self.device)
         act = torch.stack([f.act for f in list_sample_data]).to(self.device).view(-1, 1)
-        old_prob = torch.stack([f.prob for f in list_sample_data]).to(self.device).view(-1, Config.ACTION_NUM)
-        reward = torch.stack([f.reward for f in list_sample_data]).to(self.device).view(-1, Config.VALUE_NUM)
-        advantage = torch.stack([f.advantage for f in list_sample_data]).to(self.device).view(-1, Config.VALUE_NUM)
-        old_value = torch.stack([f.value for f in list_sample_data]).to(self.device).view(-1, Config.VALUE_NUM)
-        reward_sum = torch.stack([f.reward_sum for f in list_sample_data]).to(self.device).view(-1, Config.VALUE_NUM)
+        old_prob = torch.stack([f.prob for f in list_sample_data]).to(self.device)
+        reward = torch.stack([f.reward for f in list_sample_data]).to(self.device)
+        advantage = torch.stack([f.advantage for f in list_sample_data]).to(self.device)
+        old_value = torch.stack([f.value for f in list_sample_data]).to(self.device)
+        reward_sum = torch.stack([f.reward_sum for f in list_sample_data]).to(self.device)
 
         self.model.set_train_mode()
         self.optimizer.zero_grad()

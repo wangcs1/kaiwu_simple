@@ -6,8 +6,8 @@
 """
 Author: Tencent AI Arena Authors
 
-Training workflow for Blank PPO (environment-agnostic starter template).
-空白版 PPO 训练工作流（与环境无关的起步模板）。
+Training workflow for Gorge Chase PPO.
+峡谷追猎 PPO 训练工作流。
 """
 
 import os
@@ -98,7 +98,7 @@ class EpisodeRunner:
             self.logger.info(f"Episode {self.episode_cnt} start")
 
             while not done:
-                # Predict action / Agent 推理
+                # Predict action / Agent 推理（随机采样）
                 act_data = self.agent.predict(list_obs_data=[obs_data])[0]
                 act = self.agent.action_process(act_data)
 
@@ -117,17 +117,27 @@ class EpisodeRunner:
                 # Next observation / 处理下一步观测
                 _obs_data, _remain_info = self.agent.observation_process(env_obs)
 
-                # Step reward (blank: always 0) / 每步即时奖励
+                # Step reward / 每步即时奖励
                 reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
                 total_reward += float(reward[0])
 
                 # Terminal reward / 终局奖励
                 final_reward = np.zeros(1, dtype=np.float32)
                 if done:
-                    result_str = "TERMINATED" if terminated else "TRUNCATED"
+                    env_info = env_obs["observation"]["env_info"]
+                    total_score = env_info.get("total_score", 0)
+
+                    if terminated:
+                        final_reward[0] = -10.0
+                        result_str = "FAIL"
+                    else:
+                        final_reward[0] = 10.0
+                        result_str = "WIN"
+
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
-                        f"result:{result_str} total_reward:{total_reward:.3f}"
+                        f"result:{result_str} sim_score:{total_score:.1f} "
+                        f"total_reward:{total_reward:.3f}"
                     )
 
                 # Build sample frame / 构造样本帧
