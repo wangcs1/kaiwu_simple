@@ -14,8 +14,8 @@ Configuration for Gorge Chase PPO.
 class Config:
     # Observation setting / 观测设置
     VIEW_SIZE = 21
-    VIEW_CHANNELS = 4  # obstacle, treasure, monster, self
-    SCALAR_FEATURE_DIM = 8
+    VIEW_CHANNELS = 6  # passable, treasure, buff, monster, danger, visited
+    SCALAR_FEATURE_DIM = 14
 
     # Feature dimensions / 特征维度
     FEATURES = [VIEW_CHANNELS * VIEW_SIZE * VIEW_SIZE, SCALAR_FEATURE_DIM]
@@ -24,7 +24,7 @@ class Config:
     DIM_OF_OBSERVATION = FEATURE_LEN
 
     # Action space / 动作空间
-    ACTION_NUM = 8
+    ACTION_NUM = 16  # 0-7 move, 8-15 flash
 
     # Value head / 价值头
     VALUE_NUM = 1
@@ -39,15 +39,19 @@ class Config:
     GRAD_CLIP_RANGE = 0.5
 
     # Reward shaping / 奖励塑形
+    REWARD_STEP_SURVIVE = 0.006
     REWARD_STEP_PENALTY = -0.002
-    REWARD_TREASURE_PROGRESS = 0.06
-    REWARD_TREASURE_PICKUP = 0.8
-    REWARD_ESCAPE_PROGRESS = 0.08
-    REWARD_ESCAPE_DANGER_PENALTY = -0.04
-    DANGER_DISTANCE = 3.0
+    REWARD_TREASURE_PROGRESS = 0.05
+    REWARD_TREASURE_PICKUP = 1.2
+    REWARD_BUFF_PICKUP = 0.45
+    REWARD_ESCAPE_PROGRESS = 0.10
+    REWARD_DANGER_PENALTY = -0.08
+    REWARD_SAFE_BONUS = 0.004
+    REWARD_EXPLORATION = 0.006
+    REWARD_STAGNATION_PENALTY = -0.012
+    REWARD_FLASH_ESCAPE = 0.14
+    REWARD_FLASH_WASTE = -0.03
 
-    # Extra light-weight rewards / 额外轻量奖励
-    REWARD_SAFE_BONUS = 0.003
-    REWARD_DANGER_ESCAPE_BONUS = 0.05
-    REWARD_STAGNATION_PENALTY = -0.01
-    STAGNATION_STEPS = 6
+    DANGER_DISTANCE = 4.0
+    EXPLORATION_DECAY = 0.92
+    STAGNATION_STEPS = 8
