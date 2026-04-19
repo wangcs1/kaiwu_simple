@@ -23,99 +23,115 @@ class Preprocessor:
         self.step_no = 0
         self.prev_treasure_dist = None
         self.prev_monster_dist = None
-        self.prev_score = 0.0
+        self.prev_treasure_score = 0.0
+        self.prev_treasure_count = 0
+        self.prev_buff_count = 0
         self.stagnation_steps = 0
+        self.visit_counts = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
+        self.prev_monster_positions = {}
 
     def feature_process(self, env_obs, last_action):
-        """Process env_obs into feature vector, legal_action mask, and reward.
-
-        将 env_obs 转换为特征向量、合法动作掩码和即时奖励。
-        """
         self.step_no += 1
-
         observation = env_obs.get("observation", env_obs)
         frame_state = observation.get("frame_state", {})
-        legal_act_raw = observation.get("legal_action", None)
+        env_info = observation.get("env_info", {})
 
-        obstacle_map = self._extract_view_layer(
-            observation,
-            frame_state,
-            candidate_keys=["obstacle_map", "obstacle", "wall_map", "block_map", "obstacle_mask", "map_info"],
-        )
-        treasure_map = self._extract_view_layer(
-            observation,
-            frame_state,
-            candidate_keys=["treasure_map", "treasure", "chest_map", "chest", "treasure_mask"],
-        )
-        monster_map = self._extract_view_layer(
-            observation,
-            frame_state,
-            candidate_keys=["monster_map", "monster", "enemy_map", "enemy", "threat_map"],
-        )
-        self_map = self._extract_view_layer(
-            observation,
-            frame_state,
-            candidate_keys=["self_map", "agent_map", "player_map", "hero_map"],
-        )
+        hero = self._extract_hero(frame_state)
+        hero_pos = self._extract_pos(hero)
 
-        if float(self_map.sum()) <= 0:
-            center = Config.VIEW_SIZE // 2
-            self_map[center, center] = 1.0
+        passable = self._extract_map_passable(observation)
+        treasures, buffs = self._extract_organs(frame_state)
+        monsters = self._extract_monsters(frame_state)
 
-        stacked_view = np.stack([obstacle_map, treasure_map, monster_map, self_map], axis=0)
+        treasure_layer, nearest_treasure_dist = self._entity_layer(treasures, hero_pos, decay=0.0)
+        buff_layer, nearest_buff_dist = self._entity_layer(buffs, hero_pos, decay=0.0)
+        monster_layer, nearest_monster_dist = self._entity_layer(monsters, hero_pos, decay=0.0)
+        danger_layer, _ = self._entity_layer(monsters, hero_pos, decay=0.20)
+        predicted_danger = self._predict_monster_threat(monsters, hero_pos)
+        danger_layer = np.maximum(danger_layer, predicted_danger)
 
-        nearest_treasure_dist = self._nearest_distance_to_center(treasure_map)
-        nearest_monster_dist = self._nearest_distance_to_center(monster_map)
-        reward_value = self._shape_reward(observation, nearest_treasure_dist, nearest_monster_dist)
+        self.visit_counts *= Config.EXPLORATION_DECAY
+        self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2] += 1.0
+        visited_layer = np.clip(self.visit_counts / 4.0, 0.0, 1.0)
 
+        stacked = np.stack([passable, treasure_layer, buff_layer, monster_layer, danger_layer, visited_layer], axis=0)
+
+        legal_action = self._extract_legal_action(observation.get("legal_action", None))
         scalar_feature = self._build_scalar_feature(
+            env_info=env_info,
+            hero=hero,
+            legal_action=legal_action,
             last_action=last_action,
             nearest_treasure_dist=nearest_treasure_dist,
+            nearest_buff_dist=nearest_buff_dist,
             nearest_monster_dist=nearest_monster_dist,
-            treasure_map=treasure_map,
-            monster_map=monster_map,
+            has_treasure=float(treasure_layer.sum()) > 0,
+            has_buff=float(buff_layer.sum()) > 0,
+            has_monster=float(monster_layer.sum()) > 0,
         )
 
-        feature = np.concatenate([stacked_view.reshape(-1), scalar_feature], axis=0).astype(np.float32)
-        legal_action = self._extract_legal_action(legal_act_raw)
-        reward = [float(reward_value)]
-
+        feature = np.concatenate([stacked.reshape(-1), scalar_feature], axis=0).astype(np.float32)
+        reward = [
+            float(
+                self._shape_reward(
+                    env_info=env_info,
+                    last_action=last_action,
+                    nearest_treasure_dist=nearest_treasure_dist,
+                    nearest_monster_dist=nearest_monster_dist,
+                    legal_action=legal_action,
+                )
+            )
+        ]
+        self._update_monster_memory(monsters)
         return feature, legal_action, reward
 
-    def _shape_reward(self, observation, nearest_treasure_dist, nearest_monster_dist):
-        reward = Config.REWARD_STEP_PENALTY
+    def _shape_reward(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
+        reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
 
-        if nearest_treasure_dist is not None and self.prev_treasure_dist is not None:
-            reward += Config.REWARD_TREASURE_PROGRESS * (self.prev_treasure_dist - nearest_treasure_dist)
+        treasure_score = float(self._safe_get(env_info, ["treasure_score", "score"], self.prev_treasure_score))
+        treasure_score_delta = max(0.0, treasure_score - self.prev_treasure_score)
+        self.prev_treasure_score = treasure_score
 
-        if nearest_monster_dist is not None and self.prev_monster_dist is not None:
-            reward += Config.REWARD_ESCAPE_PROGRESS * (nearest_monster_dist - self.prev_monster_dist)
+        treasure_count = int(self._safe_get(env_info, ["treasures_collected"], self.prev_treasure_count))
+        treasure_count_delta = max(0, treasure_count - self.prev_treasure_count)
+        self.prev_treasure_count = treasure_count
 
-        if nearest_monster_dist is not None and nearest_monster_dist <= Config.DANGER_DISTANCE:
-            reward += Config.REWARD_ESCAPE_DANGER_PENALTY * (Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
+        buff_count = int(self._safe_get(env_info, ["collected_buff"], self.prev_buff_count))
+        buff_count_delta = max(0, buff_count - self.prev_buff_count)
+        self.prev_buff_count = buff_count
 
-        if nearest_monster_dist is not None and nearest_monster_dist > Config.DANGER_DISTANCE:
-            reward += Config.REWARD_SAFE_BONUS
+        reward += Config.REWARD_TREASURE_PICKUP * float(treasure_count_delta)
+        reward += Config.REWARD_TREASURE_PICKUP * 0.25 * treasure_score_delta
+        reward += Config.REWARD_BUFF_PICKUP * float(buff_count_delta)
 
-        if (
-            self.prev_monster_dist is not None
-            and self.prev_monster_dist <= Config.DANGER_DISTANCE
-            and nearest_monster_dist is not None
-            and nearest_monster_dist > Config.DANGER_DISTANCE
-        ):
-            reward += Config.REWARD_DANGER_ESCAPE_BONUS
-
-        score = float(self._scalar_from_obs(observation, ["score", "total_score", "game_score"], default=self.prev_score))
-        score_delta = max(0.0, score - self.prev_score)
-        if score_delta > 0:
-            reward += Config.REWARD_TREASURE_PICKUP * score_delta
-        self.prev_score = score
+        danger_level = self._danger_level(nearest_monster_dist)
+        safe_level = 1.0 - danger_level
 
         moved_on_target = False
-        if nearest_treasure_dist is not None and self.prev_treasure_dist is not None:
-            moved_on_target = abs(nearest_treasure_dist - self.prev_treasure_dist) > 1e-6
-        elif nearest_monster_dist is not None and self.prev_monster_dist is not None:
-            moved_on_target = abs(nearest_monster_dist - self.prev_monster_dist) > 1e-6
+        if self.prev_treasure_dist is not None and nearest_treasure_dist is not None:
+            delta_t = self.prev_treasure_dist - nearest_treasure_dist
+            treasure_progress_weight = (
+                Config.REWARD_TREASURE_PROGRESS_BASE + Config.REWARD_TREASURE_PROGRESS_SAFE_GAIN * safe_level
+            )
+            reward += treasure_progress_weight * delta_t
+            prev_potential = 1.0 / (self.prev_treasure_dist + 1.0)
+            curr_potential = 1.0 / (nearest_treasure_dist + 1.0)
+            reward += Config.REWARD_TREASURE_NEAR_PROGRESS * safe_level * (curr_potential - prev_potential)
+            if nearest_treasure_dist <= Config.TREASURE_NEAR_RADIUS:
+                reward += Config.REWARD_TREASURE_NEAR_BONUS * safe_level * (
+                    Config.TREASURE_NEAR_RADIUS - nearest_treasure_dist + 1.0
+                )
+            moved_on_target = moved_on_target or abs(delta_t) > 1e-6
+
+        if self.prev_monster_dist is not None and nearest_monster_dist is not None:
+            delta_m = nearest_monster_dist - self.prev_monster_dist
+            escape_progress_weight = Config.REWARD_ESCAPE_PROGRESS_BASE + Config.REWARD_ESCAPE_PROGRESS_DANGER_GAIN * danger_level
+            reward += escape_progress_weight * delta_m
+            moved_on_target = moved_on_target or abs(delta_m) > 1e-6
+
+        if nearest_monster_dist is not None:
+            danger_depth = max(0.0, Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
+            reward += Config.REWARD_MONSTER_PROXIMITY_PENALTY * danger_depth * (0.5 + danger_level)
 
         if moved_on_target:
             self.stagnation_steps = 0
@@ -124,39 +140,184 @@ class Preprocessor:
             if self.stagnation_steps >= Config.STAGNATION_STEPS:
                 reward += Config.REWARD_STAGNATION_PENALTY
 
+        novelty = 1.0 - np.clip(self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2], 0.0, 1.0)
+        reward += Config.REWARD_EXPLORATION * novelty * (0.5 + 0.5 * safe_level)
+
+        # Encourage flash for danger escape, punish blind flash.
+        used_flash = last_action is not None and last_action >= 8 and last_action < Config.ACTION_NUM
+        flash_legal = bool(np.sum(np.asarray(legal_action[8:16], dtype=np.float32)) > 0)
+        if used_flash:
+            if danger_level >= 0.4 and self.prev_monster_dist is not None and nearest_monster_dist > self.prev_monster_dist:
+                reward += Config.REWARD_FLASH_ESCAPE * (1.0 + 0.5 * danger_level)
+            elif danger_level <= 0.2:
+                reward += Config.REWARD_FLASH_WASTE_SAFE
+        elif flash_legal and danger_level >= 0.7:
+            reward += 0.4 * Config.REWARD_FLASH_WASTE_SAFE
+
         self.prev_treasure_dist = nearest_treasure_dist
         self.prev_monster_dist = nearest_monster_dist
         return reward
 
+    def _danger_level(self, nearest_monster_dist):
+        if nearest_monster_dist is None:
+            return 0.0
+        level = (Config.DANGER_DISTANCE - nearest_monster_dist) / max(1e-6, Config.DANGER_DISTANCE)
+        return float(np.clip(level, 0.0, 1.0))
+
     def _build_scalar_feature(
         self,
+        env_info,
+        hero,
+        legal_action,
         last_action,
         nearest_treasure_dist,
+        nearest_buff_dist,
         nearest_monster_dist,
-        treasure_map,
-        monster_map,
+        has_treasure,
+        has_buff,
+        has_monster,
     ):
         max_view_dist = float(Config.VIEW_SIZE - 1) * 2.0
-        has_treasure = 1.0 if float(treasure_map.sum()) > 0 else 0.0
-        has_monster = 1.0 if float(monster_map.sum()) > 0 else 0.0
-        last_action_norm = 0.0 if last_action < 0 else float(last_action) / float(max(1, Config.ACTION_NUM - 1))
+
+        total_treasure = max(1.0, float(self._safe_get(env_info, ["total_treasure"], 1.0)))
+        treasures_collected = float(self._safe_get(env_info, ["treasures_collected"], 0.0))
+        total_buff = max(1.0, float(self._safe_get(env_info, ["total_buff"], 1.0)))
+        buffs_collected = float(self._safe_get(env_info, ["collected_buff"], 0.0))
+
+        flash_count = float(self._safe_get(env_info, ["flash_count"], 0.0))
+        flash_cooldown = float(self._safe_get(env_info, ["flash_cooldown"], 0.0))
+        max_step = max(1.0, float(self._safe_get(env_info, ["max_step"], 1.0)))
+
+        speed_left = float(self._safe_get(hero, ["speed_up_buff_left", "speed_buff_left", "buff_left"], 0.0))
+
+        last_action_norm = 0.0 if last_action is None or last_action < 0 else float(last_action) / float(Config.ACTION_NUM - 1)
         treasure_dist_norm = 1.0 if nearest_treasure_dist is None else min(1.0, nearest_treasure_dist / max_view_dist)
+        buff_dist_norm = 1.0 if nearest_buff_dist is None else min(1.0, nearest_buff_dist / max_view_dist)
         monster_dist_norm = 1.0 if nearest_monster_dist is None else min(1.0, nearest_monster_dist / max_view_dist)
+
+        legal_move_ratio = float(np.mean(np.asarray(legal_action[:8], dtype=np.float32)))
+        legal_flash_ratio = float(np.mean(np.asarray(legal_action[8:16], dtype=np.float32)))
 
         scalar = np.array(
             [
-                min(1.0, self.step_no / 1000.0),
-                last_action_norm,
+                min(1.0, self.step_no / max_step),
+                treasures_collected / total_treasure,
+                buffs_collected / total_buff,
+                min(1.0, flash_count / 20.0),
+                min(1.0, flash_cooldown / 50.0),
+                min(1.0, speed_left / 50.0),
                 treasure_dist_norm,
+                buff_dist_norm,
                 monster_dist_norm,
-                has_treasure,
-                has_monster,
-                float(self.prev_treasure_dist is not None),
-                float(self.prev_monster_dist is not None),
+                1.0 if has_treasure else 0.0,
+                1.0 if has_buff else 0.0,
+                1.0 if has_monster else 0.0,
+                last_action_norm,
+                0.5 * (legal_move_ratio + legal_flash_ratio),
             ],
             dtype=np.float32,
         )
         return scalar
+
+    def _extract_map_passable(self, observation):
+        map_info = np.asarray(observation.get("map_info", np.ones((Config.VIEW_SIZE, Config.VIEW_SIZE))), dtype=np.float32)
+        map_info = self._center_crop_or_pad(map_info, Config.VIEW_SIZE)
+        return np.where(map_info > 0, 1.0, 0.0).astype(np.float32)
+
+    def _extract_hero(self, frame_state):
+        heroes = frame_state.get("heroes", []) if isinstance(frame_state, dict) else []
+        if isinstance(heroes, list) and heroes:
+            return heroes[0]
+        if isinstance(heroes, dict):
+            return heroes
+        return {}
+
+    def _extract_organs(self, frame_state):
+        treasures = []
+        buffs = []
+        organs = frame_state.get("organs", []) if isinstance(frame_state, dict) else []
+        if not isinstance(organs, list):
+            return treasures, buffs
+
+        for organ in organs:
+            if int(self._safe_get(organ, ["status"], 0)) != 1:
+                continue
+            sub_type = int(self._safe_get(organ, ["sub_type"], 0))
+            if sub_type == 1:
+                treasures.append(organ)
+            elif sub_type == 2:
+                buffs.append(organ)
+        return treasures, buffs
+
+    def _extract_monsters(self, frame_state):
+        monsters = frame_state.get("monsters", []) if isinstance(frame_state, dict) else []
+        return monsters if isinstance(monsters, list) else []
+
+    def _entity_layer(self, entities, hero_pos, decay=0.0):
+        layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
+        nearest_dist = None
+        center = Config.VIEW_SIZE // 2
+        for entity in entities:
+            pos = self._extract_pos(entity)
+            if pos is None or hero_pos is None:
+                continue
+            dx = int(pos[0] - hero_pos[0])
+            dz = int(pos[1] - hero_pos[1])
+            ix, iz = center + dx, center + dz
+            if 0 <= ix < Config.VIEW_SIZE and 0 <= iz < Config.VIEW_SIZE:
+                manhattan = float(abs(dx) + abs(dz))
+                nearest_dist = manhattan if nearest_dist is None else min(nearest_dist, manhattan)
+                if decay > 0:
+                    layer[iz, ix] = max(layer[iz, ix], np.exp(-decay * manhattan))
+                else:
+                    layer[iz, ix] = 1.0
+        return layer, nearest_dist
+
+    def _predict_monster_threat(self, monsters, hero_pos):
+        layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
+        if hero_pos is None:
+            return layer
+
+        center = Config.VIEW_SIZE // 2
+        for monster in monsters:
+            monster_id = int(self._safe_get(monster, ["monster_id"], -1))
+            cur_pos = self._extract_pos(monster)
+            if cur_pos is None:
+                continue
+
+            prev_pos = self.prev_monster_positions.get(monster_id, cur_pos)
+            vx = int(cur_pos[0] - prev_pos[0])
+            vz = int(cur_pos[1] - prev_pos[1])
+            pred_pos = (cur_pos[0] + vx, cur_pos[1] + vz)
+
+            dx = int(pred_pos[0] - hero_pos[0])
+            dz = int(pred_pos[1] - hero_pos[1])
+            ix, iz = center + dx, center + dz
+            if 0 <= ix < Config.VIEW_SIZE and 0 <= iz < Config.VIEW_SIZE:
+                dist = float(abs(dx) + abs(dz))
+                layer[iz, ix] = max(layer[iz, ix], np.exp(-0.55 * dist))
+        return layer
+
+    def _update_monster_memory(self, monsters):
+        updated = {}
+        for monster in monsters:
+            monster_id = int(self._safe_get(monster, ["monster_id"], -1))
+            pos = self._extract_pos(monster)
+            if monster_id >= 0 and pos is not None:
+                updated[monster_id] = pos
+        self.prev_monster_positions = updated
+
+    def _extract_pos(self, obj):
+        if not isinstance(obj, dict):
+            return None
+        pos = obj.get("pos", None)
+        if isinstance(pos, dict):
+            x = pos.get("x", None)
+            z = pos.get("z", None)
+            if x is None or z is None:
+                return None
+            return int(x), int(z)
+        return None
 
     def _extract_legal_action(self, legal_act_raw):
         if legal_act_raw is None:
@@ -170,48 +331,29 @@ class Preprocessor:
                 valid_set = {int(a) for a in arr if 0 <= int(a) < Config.ACTION_NUM}
                 mask = np.array([1 if i in valid_set else 0 for i in range(Config.ACTION_NUM)], dtype=np.float32)
         else:
-            return [1] * Config.ACTION_NUM
+            mask = np.ones(Config.ACTION_NUM, dtype=np.float32)
 
         if float(mask.sum()) <= 0:
             mask = np.ones(Config.ACTION_NUM, dtype=np.float32)
         return mask.tolist()
 
-    def _extract_view_layer(self, observation, frame_state, candidate_keys):
-        raw = self._find_first(observation, candidate_keys)
-        if raw is None:
-            raw = self._find_first(frame_state, candidate_keys)
-        if raw is None:
-            return np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
-
-        arr = self._to_2d_array(raw)
-        if arr is None:
-            return np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
-
-        arr = self._center_crop_or_pad(arr.astype(np.float32), Config.VIEW_SIZE)
-        return np.where(arr > 0, 1.0, 0.0).astype(np.float32)
-
-    def _to_2d_array(self, data):
-        if isinstance(data, dict):
-            nested = self._find_first(data, ["map", "grid", "data", "matrix", "mask", "view"])
-            if nested is None:
-                return None
-            return self._to_2d_array(nested)
-
-        arr = np.asarray(data)
-        if arr.ndim == 2:
-            return arr
-        if arr.ndim == 3:
-            if arr.shape[0] <= 4:
-                return np.max(arr, axis=0)
-            return np.max(arr, axis=-1)
-        if arr.ndim == 1:
-            length = arr.shape[0]
-            side = int(np.sqrt(length))
-            if side * side == length:
-                return arr.reshape(side, side)
-        return None
+    def _safe_get(self, obj, keys, default):
+        if not isinstance(obj, dict):
+            return default
+        for key in keys:
+            if key in obj:
+                return obj[key]
+        return default
 
     def _center_crop_or_pad(self, arr, target_size):
+        if arr.ndim != 2:
+            arr = np.asarray(arr).reshape(-1)
+            side = int(np.sqrt(arr.shape[0]))
+            if side * side == arr.shape[0]:
+                arr = arr.reshape(side, side)
+            else:
+                return np.zeros((target_size, target_size), dtype=np.float32)
+
         h, w = arr.shape
         out = np.zeros((target_size, target_size), dtype=np.float32)
 
@@ -226,48 +368,3 @@ class Preprocessor:
         dst_left = max(0, (target_size - cw) // 2)
         out[dst_top : dst_top + ch, dst_left : dst_left + cw] = cropped
         return out
-
-    def _nearest_distance_to_center(self, layer):
-        ys, xs = np.where(layer > 0)
-        if ys.size == 0:
-            return None
-        center = Config.VIEW_SIZE // 2
-        dist = np.abs(ys - center) + np.abs(xs - center)
-        return float(np.min(dist))
-
-    def _scalar_from_obs(self, env_obs, keys, default=0.0):
-        value = self._find_first(env_obs, keys)
-        if value is None:
-            return default
-        if isinstance(value, (list, tuple, np.ndarray)):
-            if len(value) == 0:
-                return default
-            value = value[0]
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _find_first(self, obj, candidate_keys):
-        if obj is None:
-            return None
-
-        keys = {str(k).lower() for k in candidate_keys}
-        queue = [obj]
-        max_nodes = 256
-        visited = 0
-        while queue and visited < max_nodes:
-            cur = queue.pop(0)
-            visited += 1
-            if isinstance(cur, dict):
-                for k, v in cur.items():
-                    if str(k).lower() in keys:
-                        return v
-                for v in cur.values():
-                    if isinstance(v, (dict, list, tuple)):
-                        queue.append(v)
-            elif isinstance(cur, (list, tuple)):
-                for v in cur:
-                    if isinstance(v, (dict, list, tuple)):
-                        queue.append(v)
-        return None
