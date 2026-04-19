@@ -75,7 +75,6 @@ class Preprocessor:
             float(
                 self._shape_reward(
                     env_info=env_info,
-                    hero=hero,
                     last_action=last_action,
                     nearest_treasure_dist=nearest_treasure_dist,
                     nearest_monster_dist=nearest_monster_dist,
@@ -86,7 +85,7 @@ class Preprocessor:
         self._update_monster_memory(monsters)
         return feature, legal_action, reward
 
-    def _shape_reward(self, env_info, hero, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
+    def _shape_reward(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
         reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
 
         treasure_score = float(self._safe_get(env_info, ["treasure_score", "score"], self.prev_treasure_score))
@@ -105,28 +104,34 @@ class Preprocessor:
         reward += Config.REWARD_TREASURE_PICKUP * 0.25 * treasure_score_delta
         reward += Config.REWARD_BUFF_PICKUP * float(buff_count_delta)
 
+        danger_level = self._danger_level(nearest_monster_dist)
+        safe_level = 1.0 - danger_level
+
         moved_on_target = False
         if self.prev_treasure_dist is not None and nearest_treasure_dist is not None:
             delta_t = self.prev_treasure_dist - nearest_treasure_dist
-            reward += Config.REWARD_TREASURE_PROGRESS * delta_t
+            treasure_progress_weight = (
+                Config.REWARD_TREASURE_PROGRESS_BASE + Config.REWARD_TREASURE_PROGRESS_SAFE_GAIN * safe_level
+            )
+            reward += treasure_progress_weight * delta_t
+            prev_potential = 1.0 / (self.prev_treasure_dist + 1.0)
+            curr_potential = 1.0 / (nearest_treasure_dist + 1.0)
+            reward += Config.REWARD_TREASURE_NEAR_PROGRESS * safe_level * (curr_potential - prev_potential)
+            if nearest_treasure_dist <= Config.TREASURE_NEAR_RADIUS:
+                reward += Config.REWARD_TREASURE_NEAR_BONUS * safe_level * (
+                    Config.TREASURE_NEAR_RADIUS - nearest_treasure_dist + 1.0
+                )
             moved_on_target = moved_on_target or abs(delta_t) > 1e-6
 
         if self.prev_monster_dist is not None and nearest_monster_dist is not None:
             delta_m = nearest_monster_dist - self.prev_monster_dist
-            danger_weight = 1.6 if nearest_monster_dist <= Config.DANGER_DISTANCE else 1.0
-            reward += Config.REWARD_ESCAPE_PROGRESS * danger_weight * delta_m
+            escape_progress_weight = Config.REWARD_ESCAPE_PROGRESS_BASE + Config.REWARD_ESCAPE_PROGRESS_DANGER_GAIN * danger_level
+            reward += escape_progress_weight * delta_m
             moved_on_target = moved_on_target or abs(delta_m) > 1e-6
 
         if nearest_monster_dist is not None:
-            if nearest_monster_dist <= Config.DANGER_DISTANCE:
-                danger_depth = Config.DANGER_DISTANCE - nearest_monster_dist + 1.0
-                reward += Config.REWARD_DANGER_PENALTY * danger_depth
-            else:
-                reward += Config.REWARD_SAFE_BONUS
-            if nearest_monster_dist <= Config.CRITICAL_DANGER_DISTANCE:
-                reward += Config.REWARD_CRITICAL_DANGER_PENALTY * (
-                    Config.CRITICAL_DANGER_DISTANCE - nearest_monster_dist + 1.0
-                )
+            danger_depth = max(0.0, Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
+            reward += Config.REWARD_MONSTER_PROXIMITY_PENALTY * danger_depth * (0.5 + danger_level)
 
         if moved_on_target:
             self.stagnation_steps = 0
@@ -136,24 +141,28 @@ class Preprocessor:
                 reward += Config.REWARD_STAGNATION_PENALTY
 
         novelty = 1.0 - np.clip(self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2], 0.0, 1.0)
-        reward += Config.REWARD_EXPLORATION * novelty
+        reward += Config.REWARD_EXPLORATION * novelty * (0.5 + 0.5 * safe_level)
 
         # Encourage flash for danger escape, punish blind flash.
         used_flash = last_action is not None and last_action >= 8 and last_action < Config.ACTION_NUM
         flash_legal = bool(np.sum(np.asarray(legal_action[8:16], dtype=np.float32)) > 0)
         if used_flash:
-            in_danger = nearest_monster_dist is not None and nearest_monster_dist <= Config.DANGER_DISTANCE
-            if in_danger and self.prev_monster_dist is not None and nearest_monster_dist > self.prev_monster_dist:
-                critical_bonus = 1.3 if nearest_monster_dist <= Config.CRITICAL_DANGER_DISTANCE else 1.0
-                reward += Config.REWARD_FLASH_ESCAPE * critical_bonus
-            elif not in_danger:
-                reward += Config.REWARD_FLASH_WASTE
-        elif flash_legal and nearest_monster_dist is not None and nearest_monster_dist <= Config.DANGER_DISTANCE - 1.0:
-            reward += Config.REWARD_FLASH_WASTE * 0.4
+            if danger_level >= 0.4 and self.prev_monster_dist is not None and nearest_monster_dist > self.prev_monster_dist:
+                reward += Config.REWARD_FLASH_ESCAPE * (1.0 + 0.5 * danger_level)
+            elif danger_level <= 0.2:
+                reward += Config.REWARD_FLASH_WASTE_SAFE
+        elif flash_legal and danger_level >= 0.7:
+            reward += 0.4 * Config.REWARD_FLASH_WASTE_SAFE
 
         self.prev_treasure_dist = nearest_treasure_dist
         self.prev_monster_dist = nearest_monster_dist
         return reward
+
+    def _danger_level(self, nearest_monster_dist):
+        if nearest_monster_dist is None:
+            return 0.0
+        level = (Config.DANGER_DISTANCE - nearest_monster_dist) / max(1e-6, Config.DANGER_DISTANCE)
+        return float(np.clip(level, 0.0, 1.0))
 
     def _build_scalar_feature(
         self,
@@ -297,6 +306,7 @@ class Preprocessor:
             if monster_id >= 0 and pos is not None:
                 updated[monster_id] = pos
         self.prev_monster_positions = updated
+
     def _extract_pos(self, obj):
         if not isinstance(obj, dict):
             return None
