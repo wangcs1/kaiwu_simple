@@ -297,7 +297,6 @@ class Preprocessor:
             if monster_id >= 0 and pos is not None:
                 updated[monster_id] = pos
         self.prev_monster_positions = updated
-
     def _extract_pos(self, obj):
         if not isinstance(obj, dict):
             return None
