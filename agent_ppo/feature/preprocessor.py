@@ -28,6 +28,7 @@ class Preprocessor:
         self.prev_buff_count = 0
         self.stagnation_steps = 0
         self.visit_counts = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
+        self.prev_monster_positions = {}
 
     def feature_process(self, env_obs, last_action):
         self.step_no += 1
@@ -46,6 +47,8 @@ class Preprocessor:
         buff_layer, nearest_buff_dist = self._entity_layer(buffs, hero_pos, decay=0.0)
         monster_layer, nearest_monster_dist = self._entity_layer(monsters, hero_pos, decay=0.0)
         danger_layer, _ = self._entity_layer(monsters, hero_pos, decay=0.20)
+        predicted_danger = self._predict_monster_threat(monsters, hero_pos)
+        danger_layer = np.maximum(danger_layer, predicted_danger)
 
         self.visit_counts *= Config.EXPLORATION_DECAY
         self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2] += 1.0
@@ -80,6 +83,7 @@ class Preprocessor:
                 )
             )
         ]
+        self._update_monster_memory(monsters)
         return feature, legal_action, reward
 
     def _shape_reward(self, env_info, hero, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
@@ -109,7 +113,8 @@ class Preprocessor:
 
         if self.prev_monster_dist is not None and nearest_monster_dist is not None:
             delta_m = nearest_monster_dist - self.prev_monster_dist
-            reward += Config.REWARD_ESCAPE_PROGRESS * delta_m
+            danger_weight = 1.6 if nearest_monster_dist <= Config.DANGER_DISTANCE else 1.0
+            reward += Config.REWARD_ESCAPE_PROGRESS * danger_weight * delta_m
             moved_on_target = moved_on_target or abs(delta_m) > 1e-6
 
         if nearest_monster_dist is not None:
@@ -118,6 +123,10 @@ class Preprocessor:
                 reward += Config.REWARD_DANGER_PENALTY * danger_depth
             else:
                 reward += Config.REWARD_SAFE_BONUS
+            if nearest_monster_dist <= Config.CRITICAL_DANGER_DISTANCE:
+                reward += Config.REWARD_CRITICAL_DANGER_PENALTY * (
+                    Config.CRITICAL_DANGER_DISTANCE - nearest_monster_dist + 1.0
+                )
 
         if moved_on_target:
             self.stagnation_steps = 0
@@ -135,7 +144,8 @@ class Preprocessor:
         if used_flash:
             in_danger = nearest_monster_dist is not None and nearest_monster_dist <= Config.DANGER_DISTANCE
             if in_danger and self.prev_monster_dist is not None and nearest_monster_dist > self.prev_monster_dist:
-                reward += Config.REWARD_FLASH_ESCAPE
+                critical_bonus = 1.3 if nearest_monster_dist <= Config.CRITICAL_DANGER_DISTANCE else 1.0
+                reward += Config.REWARD_FLASH_ESCAPE * critical_bonus
             elif not in_danger:
                 reward += Config.REWARD_FLASH_WASTE
         elif flash_legal and nearest_monster_dist is not None and nearest_monster_dist <= Config.DANGER_DISTANCE - 1.0:
@@ -254,6 +264,39 @@ class Preprocessor:
                     layer[iz, ix] = 1.0
         return layer, nearest_dist
 
+    def _predict_monster_threat(self, monsters, hero_pos):
+        layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
+        if hero_pos is None:
+            return layer
+
+        center = Config.VIEW_SIZE // 2
+        for monster in monsters:
+            monster_id = int(self._safe_get(monster, ["monster_id"], -1))
+            cur_pos = self._extract_pos(monster)
+            if cur_pos is None:
+                continue
+
+            prev_pos = self.prev_monster_positions.get(monster_id, cur_pos)
+            vx = int(cur_pos[0] - prev_pos[0])
+            vz = int(cur_pos[1] - prev_pos[1])
+            pred_pos = (cur_pos[0] + vx, cur_pos[1] + vz)
+
+            dx = int(pred_pos[0] - hero_pos[0])
+            dz = int(pred_pos[1] - hero_pos[1])
+            ix, iz = center + dx, center + dz
+            if 0 <= ix < Config.VIEW_SIZE and 0 <= iz < Config.VIEW_SIZE:
+                dist = float(abs(dx) + abs(dz))
+                layer[iz, ix] = max(layer[iz, ix], np.exp(-0.55 * dist))
+        return layer
+
+    def _update_monster_memory(self, monsters):
+        updated = {}
+        for monster in monsters:
+            monster_id = int(self._safe_get(monster, ["monster_id"], -1))
+            pos = self._extract_pos(monster)
+            if monster_id >= 0 and pos is not None:
+                updated[monster_id] = pos
+        self.prev_monster_positions = updated
     def _extract_pos(self, obj):
         if not isinstance(obj, dict):
             return None
