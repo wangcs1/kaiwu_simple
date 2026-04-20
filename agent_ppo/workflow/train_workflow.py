@@ -14,6 +14,7 @@ import os
 import time
 
 import numpy as np
+from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import SampleData, sample_process
 from tools.metrics_utils import get_training_metrics
 from tools.train_env_conf_validate import read_usr_conf
@@ -118,7 +119,10 @@ class EpisodeRunner:
                 _obs_data, _remain_info = self.agent.observation_process(env_obs)
 
                 # Step reward / 每步即时奖励
-                reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
+                shaped_reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
+                env_reward_arr = np.asarray(env_reward, dtype=np.float32).reshape(-1)
+                env_reward_scalar = float(env_reward_arr[0]) if env_reward_arr.size > 0 else 0.0
+                reward = shaped_reward + Config.REWARD_ENV_MIX * np.array([env_reward_scalar], dtype=np.float32)
                 total_reward += float(reward[0])
 
                 # Terminal reward / 终局奖励

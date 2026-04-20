@@ -27,8 +27,12 @@ class Preprocessor:
         self.prev_treasure_count = 0
         self.prev_buff_count = 0
         self.stagnation_steps = 0
-        self.visit_counts = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
+        self.global_visit_counts = {}
+        self.current_novelty = 1.0
         self.prev_monster_positions = {}
+        self.prev_hero_pos = None
+        self.same_pos_steps = 0
+        self.prev_last_action = -1
 
     def feature_process(self, env_obs, last_action):
         self.step_no += 1
@@ -50,13 +54,13 @@ class Preprocessor:
         predicted_danger = self._predict_monster_threat(monsters, hero_pos)
         danger_layer = np.maximum(danger_layer, predicted_danger)
 
-        self.visit_counts *= Config.EXPLORATION_DECAY
-        self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2] += 1.0
-        visited_layer = np.clip(self.visit_counts / 4.0, 0.0, 1.0)
+        self._update_stuck_state(hero_pos)
+        visited_layer, self.current_novelty = self._build_visited_layer(hero_pos)
 
         stacked = np.stack([passable, treasure_layer, buff_layer, monster_layer, danger_layer, visited_layer], axis=0)
 
         legal_action = self._extract_legal_action(observation.get("legal_action", None))
+        legal_action = self._apply_obstacle_action_mask(legal_action=legal_action, passable=passable)
         scalar_feature = self._build_scalar_feature(
             env_info=env_info,
             hero=hero,
@@ -140,8 +144,13 @@ class Preprocessor:
             if self.stagnation_steps >= Config.STAGNATION_STEPS:
                 reward += Config.REWARD_STAGNATION_PENALTY
 
-        novelty = 1.0 - np.clip(self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2], 0.0, 1.0)
-        reward += Config.REWARD_EXPLORATION * novelty * (0.5 + 0.5 * safe_level)
+        reward += Config.REWARD_EXPLORATION * self.current_novelty * (0.5 + 0.5 * safe_level)
+
+        if self.same_pos_steps >= Config.STUCK_STEPS:
+            stuck_scale = min(3.0, float(self.same_pos_steps) / float(Config.STUCK_STEPS))
+            reward += Config.REWARD_STUCK_PENALTY * stuck_scale
+            if 0 <= int(last_action) < 8 and int(last_action) == int(self.prev_last_action):
+                reward += Config.REWARD_REPEAT_ACTION_STUCK
 
         # Encourage flash for danger escape, punish blind flash.
         used_flash = last_action is not None and last_action >= 8 and last_action < Config.ACTION_NUM
@@ -154,9 +163,43 @@ class Preprocessor:
         elif flash_legal and danger_level >= 0.7:
             reward += 0.4 * Config.REWARD_FLASH_WASTE_SAFE
 
+        self.prev_last_action = -1 if last_action is None else int(last_action)
         self.prev_treasure_dist = nearest_treasure_dist
         self.prev_monster_dist = nearest_monster_dist
         return reward
+
+    def _update_stuck_state(self, hero_pos):
+        if hero_pos is None:
+            self.same_pos_steps = 0
+            self.prev_hero_pos = None
+            return
+
+        if self.prev_hero_pos is not None and hero_pos == self.prev_hero_pos:
+            self.same_pos_steps += 1
+        else:
+            self.same_pos_steps = 0
+        self.prev_hero_pos = hero_pos
+
+    def _build_visited_layer(self, hero_pos):
+        layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
+        if hero_pos is None:
+            return layer, 1.0
+
+        center = Config.VIEW_SIZE // 2
+        hero_x, hero_z = int(hero_pos[0]), int(hero_pos[1])
+
+        for dz in range(-center, center + 1):
+            for dx in range(-center, center + 1):
+                key = (hero_x + dx, hero_z + dz)
+                count = float(self.global_visit_counts.get(key, 0.0))
+                layer[center + dz, center + dx] = np.clip(count / 4.0, 0.0, 1.0)
+
+        current_key = (hero_x, hero_z)
+        current_count = float(self.global_visit_counts.get(current_key, 0.0))
+        novelty = 1.0 / np.sqrt(current_count + 1.0)
+        self.global_visit_counts[current_key] = current_count + 1.0
+
+        return layer, float(novelty)
 
     def _danger_level(self, nearest_monster_dist):
         if nearest_monster_dist is None:
@@ -336,6 +379,78 @@ class Preprocessor:
         if float(mask.sum()) <= 0:
             mask = np.ones(Config.ACTION_NUM, dtype=np.float32)
         return mask.tolist()
+
+    def _apply_obstacle_action_mask(self, legal_action, passable):
+        env_mask = np.asarray(legal_action, dtype=np.float32).reshape(-1)
+        if env_mask.size < Config.ACTION_NUM:
+            pad = np.ones(Config.ACTION_NUM - env_mask.size, dtype=np.float32)
+            env_mask = np.concatenate([env_mask, pad], axis=0)
+        env_mask = env_mask[: Config.ACTION_NUM]
+
+        if not Config.ENABLE_OBSTACLE_ACTION_MASK:
+            return env_mask.tolist()
+
+        move_mask, flash_mask = self._build_obstacle_masks(passable)
+        mode = str(Config.OBSTACLE_MASK_MODE).lower().strip()
+
+        if mode == "hard":
+            merged = env_mask.copy()
+            merged[:8] = merged[:8] * move_mask
+            merged[8:16] = merged[8:16] * flash_mask
+        else:
+            strength = float(np.clip(Config.OBSTACLE_MASK_STRENGTH, 0.0, 1.0))
+            flash_scale = float(np.clip(Config.FLASH_OBSTACLE_MASK_SCALE, 0.0, 1.0))
+
+            merged = env_mask.copy()
+            move_gate = (1.0 - strength) + strength * move_mask
+            flash_gate = (1.0 - strength * flash_scale) + strength * flash_scale * flash_mask
+            merged[:8] = merged[:8] * move_gate
+            merged[8:16] = merged[8:16] * flash_gate
+
+        if float(np.sum(merged)) <= 1e-6:
+            merged = env_mask
+        return merged.tolist()
+
+    def _build_obstacle_masks(self, passable):
+        move_mask = np.ones(8, dtype=np.float32)
+        flash_mask = np.ones(8, dtype=np.float32)
+
+        grid = np.asarray(passable, dtype=np.float32)
+        if grid.ndim != 2:
+            return move_mask, flash_mask
+
+        h, w = grid.shape
+        cz = h // 2
+        cx = w // 2
+
+        dirs = list(getattr(Config, "ACTION_MOVE_DIRS", []))
+        if len(dirs) < 8:
+            dirs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)]
+
+        for i in range(8):
+            dx, dz = int(dirs[i][0]), int(dirs[i][1])
+            nz = cz + dz
+            nx = cx + dx
+            if 0 <= nz < h and 0 <= nx < w:
+                move_mask[i] = 1.0 if grid[nz, nx] > 0.5 else 0.0
+            else:
+                move_mask[i] = 0.0
+
+            fz = cz + 2 * dz
+            fx = cx + 2 * dx
+            if 0 <= fz < h and 0 <= fx < w:
+                near_ok = 1.0 if grid[nz, nx] > 0.5 else 0.0
+                far_ok = 1.0 if grid[fz, fx] > 0.5 else 0.0
+                flash_mask[i] = 1.0 if (near_ok > 0.5 and far_ok > 0.5) else 0.0
+            else:
+                flash_mask[i] = 0.0
+
+        if float(np.sum(move_mask)) <= 1e-6:
+            move_mask[:] = 1.0
+        if float(np.sum(flash_mask)) <= 1e-6:
+            flash_mask[:] = 1.0
+
+        return move_mask, flash_mask
 
     def _safe_get(self, obj, keys, default):
         if not isinstance(obj, dict):

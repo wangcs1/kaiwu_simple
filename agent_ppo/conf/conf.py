@@ -54,8 +54,31 @@ class Config:
     REWARD_STAGNATION_PENALTY = -0.012
     REWARD_FLASH_ESCAPE = 0.18
     REWARD_FLASH_WASTE_SAFE = -0.025
+    REWARD_STUCK_PENALTY = -0.03
+    REWARD_REPEAT_ACTION_STUCK = -0.01
+
+    REWARD_ENV_MIX = 0.2
+
+    # Obstacle-aware action mask / 障碍物动作掩码
+    ENABLE_OBSTACLE_ACTION_MASK = True
+    # soft: attenuate blocked actions, hard: directly mask blocked actions
+    OBSTACLE_MASK_MODE = "soft"
+    OBSTACLE_MASK_STRENGTH = 0.65
+    FLASH_OBSTACLE_MASK_SCALE = 0.6
+    # Action direction offsets for actions 0..7 (dx, dz), configured for quick remap if env differs.
+    ACTION_MOVE_DIRS = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
+    ]
 
     DANGER_DISTANCE = 3.0
     TREASURE_NEAR_RADIUS = 3.0
     EXPLORATION_DECAY = 0.92
     STAGNATION_STEPS = 8
+    STUCK_STEPS = 3
