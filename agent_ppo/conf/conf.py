@@ -15,7 +15,7 @@ class Config:
     # Observation setting / 观测设置
     VIEW_SIZE = 9
     VIEW_CHANNELS = 6  # passable, treasure, buff, monster, danger, visited
-    SCALAR_FEATURE_DIM = 14
+    SCALAR_FEATURE_DIM = 24
 
     # Feature dimensions / 特征维度
     FEATURES = [VIEW_CHANNELS * VIEW_SIZE * VIEW_SIZE, SCALAR_FEATURE_DIM]
@@ -59,3 +59,12 @@ class Config:
     TREASURE_NEAR_RADIUS = 3.0
     EXPLORATION_DECAY = 0.92
     STAGNATION_STEPS = 8
+    TREASURE_TRACK_TOPK = 3
+    TREASURE_MEMORY_TTL = 80
+
+    # Scalar feature groups / 标量特征分组
+    HERO_FEATURE_DIM = 5
+    TREASURE_FEATURE_DIM = 6
+    MONSTER_FEATURE_DIM = 5
+    MOBILITY_FEATURE_DIM = 4
+    STAGE_FEATURE_DIM = 4

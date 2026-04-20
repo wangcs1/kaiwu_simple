@@ -68,7 +68,6 @@ class Model(nn.Module):
         self.model_name = "gorge_chase_resnet_fusion"
         self.device = device
 
-        scalar_dim = Config.SCALAR_FEATURE_DIM
         trunk_dim = 192
 
         self.map_encoder = nn.Sequential(
@@ -78,10 +77,45 @@ class Model(nn.Module):
             ConvBlock(64, 64),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-        self.scalar_encoder = nn.Sequential(
-            make_fc_layer(scalar_dim, 64),
+
+        self.hero_encoder = nn.Sequential(
+            make_fc_layer(Config.HERO_FEATURE_DIM, 32),
+            nn.SiLU(),
+            make_fc_layer(32, 32),
+            nn.SiLU(),
+        )
+        self.treasure_encoder = nn.Sequential(
+            make_fc_layer(Config.TREASURE_FEATURE_DIM, 32),
+            nn.SiLU(),
+            make_fc_layer(32, 32),
+            nn.SiLU(),
+        )
+        self.monster_encoder = nn.Sequential(
+            make_fc_layer(Config.MONSTER_FEATURE_DIM, 32),
+            nn.SiLU(),
+            make_fc_layer(32, 32),
+            nn.SiLU(),
+        )
+        self.mobility_encoder = nn.Sequential(
+            make_fc_layer(Config.MOBILITY_FEATURE_DIM, 24),
+            nn.SiLU(),
+            make_fc_layer(24, 24),
+            nn.SiLU(),
+        )
+        self.stage_encoder = nn.Sequential(
+            make_fc_layer(Config.STAGE_FEATURE_DIM, 24),
+            nn.SiLU(),
+            make_fc_layer(24, 24),
+            nn.SiLU(),
+        )
+        self.scalar_gate = nn.Sequential(
+            make_fc_layer(32 + 32 + 32 + 24 + 24, 64),
             nn.SiLU(),
             make_fc_layer(64, 64),
+            nn.Sigmoid(),
+        )
+        self.scalar_proj = nn.Sequential(
+            make_fc_layer(32 + 32 + 32 + 24 + 24, 64),
             nn.SiLU(),
         )
 
@@ -105,7 +139,27 @@ class Model(nn.Module):
 
         view = view_flat.view(batch_size, Config.VIEW_CHANNELS, Config.VIEW_SIZE, Config.VIEW_SIZE)
         map_feat = self.map_encoder(view).flatten(1)
-        scalar_feat = self.scalar_encoder(scalar)
+
+        idx = 0
+        hero = scalar[:, idx : idx + Config.HERO_FEATURE_DIM]
+        idx += Config.HERO_FEATURE_DIM
+        treasure = scalar[:, idx : idx + Config.TREASURE_FEATURE_DIM]
+        idx += Config.TREASURE_FEATURE_DIM
+        monster = scalar[:, idx : idx + Config.MONSTER_FEATURE_DIM]
+        idx += Config.MONSTER_FEATURE_DIM
+        mobility = scalar[:, idx : idx + Config.MOBILITY_FEATURE_DIM]
+        idx += Config.MOBILITY_FEATURE_DIM
+        stage = scalar[:, idx : idx + Config.STAGE_FEATURE_DIM]
+
+        scalar_parts = [
+            self.hero_encoder(hero),
+            self.treasure_encoder(treasure),
+            self.monster_encoder(monster),
+            self.mobility_encoder(mobility),
+            self.stage_encoder(stage),
+        ]
+        scalar_feat_raw = torch.cat(scalar_parts, dim=1)
+        scalar_feat = self.scalar_gate(scalar_feat_raw) * self.scalar_proj(scalar_feat_raw)
 
         trunk = self.shared(torch.cat([map_feat, scalar_feat], dim=1))
         logits = self.actor_head(trunk)
