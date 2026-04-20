@@ -38,6 +38,7 @@ class Agent(BaseAgent):
         )
         self.algorithm = Algorithm(self.model, self.optimizer, self.device, logger, monitor)
         self.preprocessor = Preprocessor()
+        self.treasure_track_topk = Config.TREASURE_TRACK_TOPK
         self.last_action = -1
         self.logger = logger
         self.monitor = monitor
@@ -61,7 +62,11 @@ class Agent(BaseAgent):
             feature=list(feature),
             legal_action=legal_action,
         )
-        remain_info = {"reward": reward}
+        remain_info = {
+            "reward": reward,
+            "feature_debug": self.preprocessor.get_last_feature_debug(),
+            "treasure_track_topk": self.treasure_track_topk,
+        }
         return obs_data, remain_info
 
     def predict(self, list_obs_data):
