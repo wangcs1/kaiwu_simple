@@ -47,7 +47,7 @@ class Preprocessor:
         hero_pos = self._extract_pos(hero)
 
         passable = self._extract_map_passable(observation)
-        treasures, buffs = self._extract_organs(frame_state)
+        treasures, buffs, organ_debug = self._extract_organs(frame_state)
         monsters = self._extract_monsters(frame_state)
 
         ranked_treasures, nearest_treasure_dist = self._rank_topk_treasures(treasures, hero_pos)
@@ -69,15 +69,34 @@ class Preprocessor:
         scalar_feature = self._build_scalar_feature(
             env_info=env_info,
             hero=hero,
+            passable=passable,
             legal_action=legal_action,
             last_action=last_action,
             nearest_treasure_dist=nearest_treasure_dist,
             nearest_buff_dist=nearest_buff_dist,
             nearest_monster_dist=nearest_monster_dist,
+            second_monster_dist=self._second_nearest_dist(monsters, hero_pos),
             has_treasure=float(treasure_layer.sum()) > 0,
             has_buff=float(buff_layer.sum()) > 0,
             has_monster=float(monster_layer.sum()) > 0,
         )
+
+        self.last_feature_debug = {
+            "treasure_source": organ_debug.get("source", "unknown"),
+            "treasure_count": len(tracked_treasures),
+            "visible_treasure_count": len(treasures),
+            "buff_count": len(buffs),
+            "nearest_treasure_dist": nearest_treasure_dist,
+            "treasure_layer_sum": float(treasure_layer.sum()),
+            "treasure_topk": [
+                {
+                    "id": t.get("memory_id", -1),
+                    "dist": t.get("rank_dist", None),
+                    "value": t.get("rank_value", 0.0),
+                }
+                for t in tracked_treasures
+            ],
+        }
 
         feature = np.concatenate([stacked.reshape(-1), scalar_feature], axis=0).astype(np.float32)
         reward = [
@@ -261,11 +280,13 @@ class Preprocessor:
         self,
         env_info,
         hero,
+        passable,
         legal_action,
         last_action,
         nearest_treasure_dist,
         nearest_buff_dist,
         nearest_monster_dist,
+        second_monster_dist,
         has_treasure,
         has_buff,
         has_monster,
@@ -287,29 +308,69 @@ class Preprocessor:
         treasure_dist_norm = 1.0 if nearest_treasure_dist is None else min(1.0, nearest_treasure_dist / max_view_dist)
         buff_dist_norm = 1.0 if nearest_buff_dist is None else min(1.0, nearest_buff_dist / max_view_dist)
         monster_dist_norm = 1.0 if nearest_monster_dist is None else min(1.0, nearest_monster_dist / max_view_dist)
+        second_monster_dist_norm = (
+            1.0 if second_monster_dist is None else min(1.0, second_monster_dist / max_view_dist)
+        )
+        danger_level = self._danger_level(nearest_monster_dist)
+        corridor_score = self._corridor_score(passable)
+        alive_space = self._alive_space_ratio(passable)
+        is_speed_stage = 1.0 if danger_level > 0.45 or second_monster_dist_norm < 0.5 else 0.0
 
         legal_move_ratio = float(np.mean(np.asarray(legal_action[:8], dtype=np.float32)))
         legal_flash_ratio = float(np.mean(np.asarray(legal_action[8:16], dtype=np.float32)))
+        flash_ready = 1.0 if float(flash_cooldown) <= 1e-5 and legal_flash_ratio > 0 else 0.0
+        recent_novelty = 1.0 - np.clip(self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2], 0.0, 1.0)
 
-        scalar = np.array(
+        hero_state = np.array(
             [
                 min(1.0, self.step_no / max_step),
-                treasures_collected / total_treasure,
-                buffs_collected / total_buff,
+                min(1.0, speed_left / 50.0),
                 min(1.0, flash_count / 20.0),
                 min(1.0, flash_cooldown / 50.0),
-                min(1.0, speed_left / 50.0),
+                flash_ready,
+            ],
+            dtype=np.float32,
+        )
+        treasure_state = np.array(
+            [
+                treasures_collected / total_treasure,
+                buffs_collected / total_buff,
                 treasure_dist_norm,
                 buff_dist_norm,
-                monster_dist_norm,
                 1.0 if has_treasure else 0.0,
                 1.0 if has_buff else 0.0,
+            ],
+            dtype=np.float32,
+        )
+        monster_state = np.array(
+            [
+                monster_dist_norm,
+                second_monster_dist_norm,
+                danger_level,
                 1.0 if has_monster else 0.0,
+                1.0 if second_monster_dist_norm < 0.45 else 0.0,
+            ],
+            dtype=np.float32,
+        )
+        mobility_state = np.array(
+            [
+                legal_move_ratio,
+                legal_flash_ratio,
+                corridor_score,
+                alive_space,
+            ],
+            dtype=np.float32,
+        )
+        stage_state = np.array(
+            [
                 last_action_norm,
+                recent_novelty,
+                is_speed_stage,
                 0.5 * (legal_move_ratio + legal_flash_ratio),
             ],
             dtype=np.float32,
         )
+        scalar = np.concatenate([hero_state, treasure_state, monster_state, mobility_state, stage_state], axis=0)
         return scalar
 
     def _extract_map_passable(self, observation):
@@ -328,23 +389,135 @@ class Preprocessor:
     def _extract_organs(self, frame_state):
         treasures = []
         buffs = []
-        organs = frame_state.get("organs", []) if isinstance(frame_state, dict) else []
-        if not isinstance(organs, list):
-            return treasures, buffs
+        debug = {"source": "none"}
+        organ_sources = []
+        if isinstance(frame_state, dict):
+            for key in ("organs", "treasures", "buffs", "items"):
+                raw = frame_state.get(key, [])
+                entities = self._as_entity_list(raw)
+                if entities:
+                    organ_sources.append((key, entities))
+        if not organ_sources:
+            return treasures, buffs, debug
 
-        for organ in organs:
-            if int(self._safe_get(organ, ["status"], 0)) != 1:
+        for source, entities in organ_sources:
+            debug["source"] = source
+            for organ in entities:
+                status = int(self._safe_get(organ, ["status", "alive", "active"], 1))
+                if status not in (1, True):
+                    continue
+                sub_type = int(self._safe_get(organ, ["sub_type", "type", "organ_type"], 0))
+                if source == "treasures" and sub_type == 0:
+                    sub_type = 1
+                elif source == "buffs" and sub_type == 0:
+                    sub_type = 2
+                name = str(self._safe_get(organ, ["name"], "")).lower()
+                if sub_type == 1 or "treasure" in name or "chest" in name or "宝箱" in name:
+                    treasures.append(organ)
+                elif sub_type == 2 or "buff" in name:
+                    buffs.append(organ)
+        return treasures, buffs, debug
+
+    def _as_entity_list(self, raw):
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+        if isinstance(raw, dict):
+            values = [v for v in raw.values() if isinstance(v, dict)]
+            return values if values else [raw]
+        return []
+
+    def _second_nearest_dist(self, entities, hero_pos):
+        dists = []
+        for entity in entities:
+            pos = self._extract_pos(entity)
+            if pos is None or hero_pos is None:
                 continue
-            sub_type = int(self._safe_get(organ, ["sub_type"], 0))
-            if sub_type == 1:
-                treasures.append(organ)
-            elif sub_type == 2:
-                buffs.append(organ)
-        return treasures, buffs
+            dx = int(pos[0] - hero_pos[0])
+            dz = int(pos[1] - hero_pos[1])
+            dists.append(float(abs(dx) + abs(dz)))
+        if len(dists) < 2:
+            return None
+        dists.sort()
+        return dists[1]
 
     def _extract_monsters(self, frame_state):
         monsters = frame_state.get("monsters", []) if isinstance(frame_state, dict) else []
         return monsters if isinstance(monsters, list) else []
+
+    def _update_and_rank_treasures(self, visible_treasures, hero_pos):
+        for mem in self.treasure_memory.values():
+            mem["visible"] = False
+
+        for treasure in visible_treasures:
+            memory_id = self._treasure_memory_id(treasure)
+            pos = self._extract_pos(treasure)
+            if pos is None:
+                continue
+            prev = self.treasure_memory.get(
+                memory_id,
+                {
+                    "memory_id": memory_id,
+                    "last_seen": -1,
+                    "value": 0.0,
+                    "pos": pos,
+                },
+            )
+            prev["pos"] = pos
+            prev["last_seen"] = self.step_no
+            prev["visible"] = True
+            prev["value"] = max(prev.get("value", 0.0), self._treasure_value(treasure))
+            self.treasure_memory[memory_id] = prev
+
+        stale_ids = []
+        for memory_id, mem in self.treasure_memory.items():
+            if self.step_no - int(mem.get("last_seen", -1)) > Config.TREASURE_MEMORY_TTL:
+                stale_ids.append(memory_id)
+        for memory_id in stale_ids:
+            self.treasure_memory.pop(memory_id, None)
+
+        ranked = []
+        for mem in self.treasure_memory.values():
+            mem_pos = mem.get("pos", None)
+            if mem_pos is None or hero_pos is None:
+                rank_dist = 1e6
+            else:
+                rank_dist = float(abs(mem_pos[0] - hero_pos[0]) + abs(mem_pos[1] - hero_pos[1]))
+            ranked.append(
+                {
+                    "memory_id": int(mem.get("memory_id", -1)),
+                    "pos": {"x": int(mem_pos[0]), "z": int(mem_pos[1])},
+                    "rank_dist": rank_dist,
+                    "rank_value": float(mem.get("value", 0.0)),
+                    "visible": 1.0 if bool(mem.get("visible", False)) else 0.0,
+                    "recency": float(self.step_no - int(mem.get("last_seen", -1))),
+                }
+            )
+
+        ranked.sort(
+            key=lambda x: (
+                -x["visible"],
+                -x["rank_value"],
+                x["rank_dist"],
+                x["recency"],
+            )
+        )
+        return ranked[: Config.TREASURE_TRACK_TOPK]
+
+    def _treasure_memory_id(self, treasure):
+        fixed_id = self._safe_get(treasure, ["organ_id", "id", "treasure_id"], None)
+        if fixed_id is not None:
+            return int(fixed_id)
+        pos = self._extract_pos(treasure)
+        if pos is None:
+            return -1
+        return int(pos[0] * 1000 + pos[1])
+
+    def _treasure_value(self, treasure):
+        score = self._safe_get(treasure, ["score", "value", "reward"], 0.0)
+        try:
+            return float(score)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _entity_layer(self, entities, hero_pos, decay=0.0):
         layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
@@ -411,6 +584,30 @@ class Preprocessor:
                 return None
             return int(x), int(z)
         return None
+
+    def _corridor_score(self, passable):
+        center = Config.VIEW_SIZE // 2
+        if passable.shape != (Config.VIEW_SIZE, Config.VIEW_SIZE):
+            return 0.0
+        rays = []
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            length = 0
+            x, z = center, center
+            while True:
+                x += dx
+                z += dz
+                if not (0 <= x < Config.VIEW_SIZE and 0 <= z < Config.VIEW_SIZE):
+                    break
+                if passable[z, x] <= 0.5:
+                    break
+                length += 1
+            rays.append(length / float(Config.VIEW_SIZE - 1))
+        return float(np.mean(rays))
+
+    def _alive_space_ratio(self, passable):
+        if passable.shape != (Config.VIEW_SIZE, Config.VIEW_SIZE):
+            return 0.0
+        return float(np.mean(passable > 0.5))
 
     def _extract_legal_action(self, legal_act_raw):
         if legal_act_raw is None:

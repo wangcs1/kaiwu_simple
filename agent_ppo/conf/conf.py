@@ -15,7 +15,7 @@ class Config:
     # Observation setting / 观测设置
     VIEW_SIZE = 9
     VIEW_CHANNELS = 6  # passable, treasure, buff, monster, danger, visited
-    SCALAR_FEATURE_DIM = 14
+    SCALAR_FEATURE_DIM = 24
 
     # Feature dimensions / 特征维度
     FEATURES = [VIEW_CHANNELS * VIEW_SIZE * VIEW_SIZE, SCALAR_FEATURE_DIM]
