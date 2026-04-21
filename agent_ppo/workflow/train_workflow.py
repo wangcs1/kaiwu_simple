@@ -95,6 +95,8 @@ class EpisodeRunner:
             done = False
             step = 0
             total_reward = 0.0
+            total_shaped_reward = 0.0
+            total_env_reward = 0.0
 
             self.logger.info(f"Episode {self.episode_cnt} start")
 
@@ -122,8 +124,11 @@ class EpisodeRunner:
                 shaped_reward = np.array(_remain_info.get("reward", [0.0]), dtype=np.float32)
                 env_reward_arr = np.asarray(env_reward, dtype=np.float32).reshape(-1)
                 env_reward_scalar = float(env_reward_arr[0]) if env_reward_arr.size > 0 else 0.0
-                reward = shaped_reward + Config.REWARD_ENV_MIX * np.array([env_reward_scalar], dtype=np.float32)
+                mix = float(np.clip(Config.REWARD_ENV_MIX, 0.0, 1.0))
+                reward = (1.0 - mix) * shaped_reward + mix * np.array([env_reward_scalar], dtype=np.float32)
                 total_reward += float(reward[0])
+                total_shaped_reward += float(shaped_reward[0])
+                total_env_reward += env_reward_scalar
 
                 # Terminal reward / 终局奖励
                 final_reward = np.zeros(1, dtype=np.float32)
@@ -141,7 +146,9 @@ class EpisodeRunner:
                     self.logger.info(
                         f"[GAMEOVER] episode:{self.episode_cnt} steps:{step} "
                         f"result:{result_str} sim_score:{total_score:.1f} "
-                        f"total_reward:{total_reward:.3f}"
+                        f"total_reward:{total_reward:.3f} "
+                        f"shaped_reward:{total_shaped_reward:.3f} "
+                        f"env_reward:{total_env_reward:.3f}"
                     )
 
                 # Build sample frame / 构造样本帧
@@ -169,6 +176,8 @@ class EpisodeRunner:
                     if now - self.last_report_monitor_time >= 60 and self.monitor:
                         monitor_data = {
                             "reward": round(total_reward + float(final_reward[0]), 4),
+                            "reward_shaped": round(total_shaped_reward, 4),
+                            "reward_env": round(total_env_reward, 4),
                             "episode_steps": step,
                             "episode_cnt": self.episode_cnt,
                         }

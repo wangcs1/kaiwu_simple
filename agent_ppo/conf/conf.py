@@ -37,6 +37,10 @@ class Config:
     CLIP_PARAM = 0.2
     VF_COEF = 1.0
     GRAD_CLIP_RANGE = 0.5
+    PPO_EPOCHS = 4
+    PPO_MINIBATCH_SIZE = 128
+    BETA_END = 0.0002
+    BETA_DECAY_STEPS = 200000
 
     # Reward shaping / 奖励塑形
     REWARD_STEP_SURVIVE = 0.006
@@ -57,6 +61,7 @@ class Config:
     REWARD_STUCK_PENALTY = -0.03
     REWARD_REPEAT_ACTION_STUCK = -0.01
 
+    # Final reward = (1 - REWARD_ENV_MIX) * shaped + REWARD_ENV_MIX * env_reward
     REWARD_ENV_MIX = 0.2
 
     # Obstacle-aware action mask / 障碍物动作掩码
@@ -83,7 +88,17 @@ class Config:
     STAGNATION_STEPS = 8
     STUCK_STEPS = 3
 
+    # Monster acceleration phase / 怪物加速阶段
+    MONSTER_ACCEL_STEP = 500
+    ESCAPE_WEIGHT_AFTER_ACCEL = 1.8
+    MONSTER_PENALTY_AFTER_ACCEL = 1.5
+
     # Treasure top-k tracking / 宝箱 top-k 追踪
     TREASURE_TARGET_TOPK = 3
     TREASURE_MEMORY_TTL = 12
     TREASURE_NEW_SEEN_COUNT = 1
+    TREASURE_RANK_NEW_BONUS = 1.2
+    TREASURE_RANK_DIST_WEIGHT = 0.10
+    TREASURE_RANK_RISK_WEIGHT = 0.28
+    TREASURE_RANK_RECENCY_WEIGHT = 0.04
+    TREASURE_RANK_VALUE_WEIGHT = 0.02

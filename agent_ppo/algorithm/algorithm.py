@@ -61,25 +61,50 @@ class Algorithm:
         )
 
         self.model.set_train_mode()
-        self.optimizer.zero_grad()
+        self._update_entropy_beta()
 
-        logits, value_pred = self.model(obs)
+        num_samples = obs.shape[0]
+        minibatch_size = int(max(1, min(Config.PPO_MINIBATCH_SIZE, num_samples)))
+        ppo_epochs = int(max(1, Config.PPO_EPOCHS))
 
-        total_loss, info_list = self._compute_loss(
-            logits=logits,
-            value_pred=value_pred,
-            legal_action=legal_action,
-            old_action=act,
-            old_prob=old_prob,
-            advantage=advantage,
-            old_value=old_value,
-            reward_sum=reward_sum,
-            reward=reward,
-        )
+        loss_stats = []
+        for _ in range(ppo_epochs):
+            perm = torch.randperm(num_samples, device=obs.device)
+            for start in range(0, num_samples, minibatch_size):
+                idx = perm[start : start + minibatch_size]
+                if idx.numel() <= 0:
+                    continue
 
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters, Config.GRAD_CLIP_RANGE)
-        self.optimizer.step()
+                logits, value_pred = self.model(obs[idx])
+                total_loss, info_list = self._compute_loss(
+                    logits=logits,
+                    value_pred=value_pred,
+                    legal_action=legal_action[idx],
+                    old_action=act[idx],
+                    old_prob=old_prob[idx],
+                    advantage=advantage[idx],
+                    old_value=old_value[idx],
+                    reward_sum=reward_sum[idx],
+                    reward=reward[idx],
+                )
+
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters, Config.GRAD_CLIP_RANGE)
+                self.optimizer.step()
+                loss_stats.append((total_loss.detach(), info_list[0].detach(), info_list[1].detach(), info_list[2].detach()))
+
+        if loss_stats:
+            total_loss = torch.stack([x[0] for x in loss_stats]).mean()
+            info_list = [
+                torch.stack([x[1] for x in loss_stats]).mean(),
+                torch.stack([x[2] for x in loss_stats]).mean(),
+                torch.stack([x[3] for x in loss_stats]).mean(),
+            ]
+        else:
+            total_loss = torch.tensor(0.0, device=obs.device)
+            info_list = [torch.tensor(0.0, device=obs.device)] * 3
+
         self.train_step += 1
 
         now = time.time()
@@ -90,12 +115,14 @@ class Algorithm:
                 "policy_loss": round(info_list[1].item(), 4),
                 "entropy_loss": round(info_list[2].item(), 4),
                 "reward": round(reward.mean().item(), 4),
+                "entropy_beta": round(float(self.var_beta), 6),
             }
             self.logger.info(
                 f"[train] total_loss:{results['total_loss']} "
                 f"policy_loss:{results['policy_loss']} "
                 f"value_loss:{results['value_loss']} "
-                f"entropy:{results['entropy_loss']}"
+                f"entropy:{results['entropy_loss']} "
+                f"beta:{results['entropy_beta']}"
             )
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
@@ -150,6 +177,13 @@ class Algorithm:
         total_loss = self.vf_coef * value_loss + policy_loss - self.var_beta * entropy_loss
 
         return total_loss, [value_loss, policy_loss, entropy_loss]
+
+    def _update_entropy_beta(self):
+        decay_steps = float(max(1, Config.BETA_DECAY_STEPS))
+        progress = min(1.0, float(self.train_step) / decay_steps)
+        start = float(Config.BETA_START)
+        end = float(Config.BETA_END)
+        self.var_beta = start + (end - start) * progress
 
     def _masked_softmax(self, logits, legal_action):
         """Softmax with legal action masking (suppress illegal actions).

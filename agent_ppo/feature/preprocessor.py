@@ -50,7 +50,8 @@ class Preprocessor:
         treasures, buffs, organ_debug = self._extract_organs(frame_state)
         monsters = self._extract_monsters(frame_state)
 
-        ranked_treasures, nearest_treasure_dist = self._rank_topk_treasures(treasures, hero_pos)
+        ranked_treasures, nearest_treasure_dist = self._rank_topk_treasures(treasures, hero_pos, monsters)
+        tracked_treasures = self._build_treasure_debug_topk(ranked_treasures, hero_pos)
 
         treasure_layer, _ = self._entity_layer(ranked_treasures, hero_pos, decay=0.0)
         buff_layer, nearest_buff_dist = self._entity_layer(buffs, hero_pos, decay=0.0)
@@ -82,17 +83,24 @@ class Preprocessor:
         )
 
         self.last_feature_debug = {
+            "step_no": int(self.step_no),
             "treasure_source": organ_debug.get("source", "unknown"),
-            "treasure_count": len(tracked_treasures),
-            "visible_treasure_count": len(treasures),
-            "buff_count": len(buffs),
-            "nearest_treasure_dist": nearest_treasure_dist,
+            "treasure_count": int(len(ranked_treasures)),
+            "visible_treasure_count": int(len(treasures)),
+            "buff_count": int(len(buffs)),
+            "nearest_treasure_dist": None if nearest_treasure_dist is None else float(nearest_treasure_dist),
+            "target_treasure_dist": None if self.current_target_dist is None else float(self.current_target_dist),
             "treasure_layer_sum": float(treasure_layer.sum()),
             "treasure_topk": [
                 {
-                    "id": t.get("memory_id", -1),
-                    "dist": t.get("rank_dist", None),
-                    "value": t.get("rank_value", 0.0),
+                    "id": int(t.get("id", -1)),
+                    "dist": None if t.get("dist", None) is None else float(t.get("dist", 0.0)),
+                    "seen_count": int(t.get("seen_count", 0)),
+                    "is_new": int(t.get("is_new", 0)),
+                    "pos": {
+                        "x": int(self._safe_get(t, ["x"], -1)),
+                        "z": int(self._safe_get(t, ["z"], -1)),
+                    },
                 }
                 for t in tracked_treasures
             ],
@@ -113,7 +121,7 @@ class Preprocessor:
         self._update_monster_memory(monsters)
         return feature, legal_action, reward
 
-    def _rank_topk_treasures(self, treasures, hero_pos):
+    def _rank_topk_treasures(self, treasures, hero_pos, monsters):
         if hero_pos is None:
             self.current_target_dist = None
             return treasures, None
@@ -135,11 +143,20 @@ class Preprocessor:
                 }
             item["seen_count"] = int(item.get("seen_count", 0)) + 1
             item["last_seen"] = current_step
+            item["last_pos"] = pos
+            item["value"] = max(float(item.get("value", 0.0)), self._treasure_value(t))
             self.treasure_memory[key] = item
 
             dist = float(abs(pos[0] - hero_pos[0]) + abs(pos[1] - hero_pos[1]))
             is_new = 1 if item["seen_count"] <= Config.TREASURE_NEW_SEEN_COUNT else 0
-            visible.append((is_new, dist, -item["last_seen"], t))
+            score = self._treasure_priority_score(
+                dist=dist,
+                is_new=is_new,
+                recency=(current_step - int(item.get("last_seen", current_step))),
+                value=float(item.get("value", 0.0)),
+                risk=self._treasure_risk(pos, monsters),
+            )
+            visible.append((score, dist, t))
 
         ttl = int(Config.TREASURE_MEMORY_TTL)
         stale_keys = [
@@ -149,17 +166,79 @@ class Preprocessor:
             self.treasure_memory.pop(key, None)
 
         if not visible:
-            self.current_target_dist = None
-            return treasures, None
+            memory_candidates = []
+            for key, item in self.treasure_memory.items():
+                pos = item.get("last_pos", key)
+                if not isinstance(pos, tuple) or len(pos) != 2:
+                    continue
+                dist = float(abs(pos[0] - hero_pos[0]) + abs(pos[1] - hero_pos[1]))
+                recency = float(current_step - int(item.get("last_seen", current_step)))
+                is_new = 1 if int(item.get("seen_count", 0)) <= Config.TREASURE_NEW_SEEN_COUNT else 0
+                score = self._treasure_priority_score(
+                    dist=dist,
+                    is_new=is_new,
+                    recency=recency,
+                    value=float(item.get("value", 0.0)),
+                    risk=self._treasure_risk(pos, monsters),
+                )
+                memory_candidates.append(
+                    (
+                        score,
+                        dist,
+                        {
+                            "pos": {"x": int(pos[0]), "z": int(pos[1])},
+                            "organ_id": -1,
+                            "name": "memory_treasure",
+                        },
+                    )
+                )
 
-        visible.sort(key=lambda x: (-x[0], x[1], x[2]))
+            if not memory_candidates:
+                self.current_target_dist = None
+                return treasures, None
+
+            memory_candidates.sort(key=lambda x: (-x[0], x[1]))
+            topk = max(1, int(self.treasure_topk))
+            selected = [x[2] for x in memory_candidates[:topk]]
+            self.current_target_dist = float(memory_candidates[0][1])
+            return selected, self.current_target_dist
+
+        visible.sort(key=lambda x: (-x[0], x[1]))
         topk = max(1, int(self.treasure_topk))
-        selected = [x[3] for x in visible[:topk]]
+        selected = [x[2] for x in visible[:topk]]
         self.current_target_dist = float(visible[0][1])
         return selected, self.current_target_dist
 
+    def _treasure_priority_score(self, dist, is_new, recency, value, risk):
+        return (
+            Config.TREASURE_RANK_NEW_BONUS * float(is_new)
+            - Config.TREASURE_RANK_DIST_WEIGHT * float(dist)
+            - Config.TREASURE_RANK_RISK_WEIGHT * float(risk)
+            - Config.TREASURE_RANK_RECENCY_WEIGHT * float(recency)
+            + Config.TREASURE_RANK_VALUE_WEIGHT * float(value)
+        )
+
+    def _treasure_risk(self, target_pos, monsters):
+        if target_pos is None or not monsters:
+            return 0.0
+
+        nearest = None
+        for monster in monsters:
+            mpos = self._extract_pos(monster)
+            if mpos is None:
+                continue
+            md = float(abs(mpos[0] - target_pos[0]) + abs(mpos[1] - target_pos[1]))
+            nearest = md if nearest is None else min(nearest, md)
+
+        if nearest is None:
+            return 0.0
+        return max(0.0, Config.DANGER_DISTANCE + 1.0 - float(nearest))
+
     def _shape_reward(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
         reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
+        post_accel = self.step_no >= int(Config.MONSTER_ACCEL_STEP)
+        escape_phase_scale = float(Config.ESCAPE_WEIGHT_AFTER_ACCEL) if post_accel else 1.0
+        danger_penalty_scale = float(Config.MONSTER_PENALTY_AFTER_ACCEL) if post_accel else 1.0
 
         treasure_score = float(self._safe_get(env_info, ["treasure_score", "score"], self.prev_treasure_score))
         treasure_score_delta = max(0.0, treasure_score - self.prev_treasure_score)
@@ -199,12 +278,17 @@ class Preprocessor:
         if self.prev_monster_dist is not None and nearest_monster_dist is not None:
             delta_m = nearest_monster_dist - self.prev_monster_dist
             escape_progress_weight = Config.REWARD_ESCAPE_PROGRESS_BASE + Config.REWARD_ESCAPE_PROGRESS_DANGER_GAIN * danger_level
-            reward += escape_progress_weight * delta_m
+            reward += escape_phase_scale * escape_progress_weight * delta_m
             moved_on_target = moved_on_target or abs(delta_m) > 1e-6
 
         if nearest_monster_dist is not None:
             danger_depth = max(0.0, Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
-            reward += Config.REWARD_MONSTER_PROXIMITY_PENALTY * danger_depth * (0.5 + danger_level)
+            reward += (
+                danger_penalty_scale
+                * Config.REWARD_MONSTER_PROXIMITY_PENALTY
+                * danger_depth
+                * (0.5 + danger_level)
+            )
 
         if moved_on_target:
             self.stagnation_steps = 0
@@ -319,7 +403,7 @@ class Preprocessor:
         legal_move_ratio = float(np.mean(np.asarray(legal_action[:8], dtype=np.float32)))
         legal_flash_ratio = float(np.mean(np.asarray(legal_action[8:16], dtype=np.float32)))
         flash_ready = 1.0 if float(flash_cooldown) <= 1e-5 and legal_flash_ratio > 0 else 0.0
-        recent_novelty = 1.0 - np.clip(self.visit_counts[Config.VIEW_SIZE // 2, Config.VIEW_SIZE // 2], 0.0, 1.0)
+        recent_novelty = float(np.clip(self.current_novelty, 0.0, 1.0))
 
         hero_state = np.array(
             [
@@ -485,7 +569,10 @@ class Preprocessor:
             ranked.append(
                 {
                     "memory_id": int(mem.get("memory_id", -1)),
-                    "pos": {"x": int(mem_pos[0]), "z": int(mem_pos[1])},
+                    "pos": {
+                        "x": int(mem_pos[0]) if mem_pos is not None else -1,
+                        "z": int(mem_pos[1]) if mem_pos is not None else -1,
+                    },
                     "rank_dist": rank_dist,
                     "rank_value": float(mem.get("value", 0.0)),
                     "visible": 1.0 if bool(mem.get("visible", False)) else 0.0,
@@ -501,7 +588,34 @@ class Preprocessor:
                 x["recency"],
             )
         )
-        return ranked[: Config.TREASURE_TRACK_TOPK]
+        return ranked[: Config.TREASURE_TARGET_TOPK]
+
+    def _build_treasure_debug_topk(self, ranked_treasures, hero_pos):
+        debug_items = []
+        for treasure in ranked_treasures:
+            pos = self._extract_pos(treasure)
+            if pos is None:
+                continue
+
+            key = (int(pos[0]), int(pos[1]))
+            item = self.treasure_memory.get(key, {})
+            if hero_pos is None:
+                dist = None
+            else:
+                dist = float(abs(pos[0] - hero_pos[0]) + abs(pos[1] - hero_pos[1]))
+
+            debug_items.append(
+                {
+                    "id": int(self._safe_get(treasure, ["organ_id", "id", "treasure_id"], -1)),
+                    "x": int(pos[0]),
+                    "z": int(pos[1]),
+                    "dist": dist,
+                    "seen_count": int(item.get("seen_count", 0)),
+                    "is_new": 1 if int(item.get("seen_count", 0)) <= int(Config.TREASURE_NEW_SEEN_COUNT) else 0,
+                }
+            )
+
+        return debug_items
 
     def _treasure_memory_id(self, treasure):
         fixed_id = self._safe_get(treasure, ["organ_id", "id", "treasure_id"], None)
