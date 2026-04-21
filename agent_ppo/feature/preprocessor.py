@@ -16,7 +16,8 @@ from agent_ppo.conf.conf import Config
 
 
 class Preprocessor:
-    def __init__(self):
+    def __init__(self, treasure_topk=None):
+        self.treasure_topk = int(treasure_topk if treasure_topk is not None else Config.TREASURE_TARGET_TOPK)
         self.reset()
 
     def reset(self):
@@ -33,6 +34,8 @@ class Preprocessor:
         self.prev_hero_pos = None
         self.same_pos_steps = 0
         self.prev_last_action = -1
+        self.treasure_memory = {}
+        self.current_target_dist = None
 
     def feature_process(self, env_obs, last_action):
         self.step_no += 1
@@ -47,7 +50,9 @@ class Preprocessor:
         treasures, buffs = self._extract_organs(frame_state)
         monsters = self._extract_monsters(frame_state)
 
-        treasure_layer, nearest_treasure_dist = self._entity_layer(treasures, hero_pos, decay=0.0)
+        ranked_treasures, nearest_treasure_dist = self._rank_topk_treasures(treasures, hero_pos)
+
+        treasure_layer, _ = self._entity_layer(ranked_treasures, hero_pos, decay=0.0)
         buff_layer, nearest_buff_dist = self._entity_layer(buffs, hero_pos, decay=0.0)
         monster_layer, nearest_monster_dist = self._entity_layer(monsters, hero_pos, decay=0.0)
         danger_layer, _ = self._entity_layer(monsters, hero_pos, decay=0.20)
@@ -88,6 +93,51 @@ class Preprocessor:
         ]
         self._update_monster_memory(monsters)
         return feature, legal_action, reward
+
+    def _rank_topk_treasures(self, treasures, hero_pos):
+        if hero_pos is None:
+            self.current_target_dist = None
+            return treasures, None
+
+        current_step = int(self.step_no)
+        visible = []
+        for t in treasures:
+            pos = self._extract_pos(t)
+            if pos is None:
+                continue
+
+            key = (int(pos[0]), int(pos[1]))
+            item = self.treasure_memory.get(key)
+            if item is None:
+                item = {
+                    "first_seen": current_step,
+                    "last_seen": current_step,
+                    "seen_count": 0,
+                }
+            item["seen_count"] = int(item.get("seen_count", 0)) + 1
+            item["last_seen"] = current_step
+            self.treasure_memory[key] = item
+
+            dist = float(abs(pos[0] - hero_pos[0]) + abs(pos[1] - hero_pos[1]))
+            is_new = 1 if item["seen_count"] <= Config.TREASURE_NEW_SEEN_COUNT else 0
+            visible.append((is_new, dist, -item["last_seen"], t))
+
+        ttl = int(Config.TREASURE_MEMORY_TTL)
+        stale_keys = [
+            k for k, v in self.treasure_memory.items() if (current_step - int(v.get("last_seen", current_step))) > ttl
+        ]
+        for key in stale_keys:
+            self.treasure_memory.pop(key, None)
+
+        if not visible:
+            self.current_target_dist = None
+            return treasures, None
+
+        visible.sort(key=lambda x: (-x[0], x[1], x[2]))
+        topk = max(1, int(self.treasure_topk))
+        selected = [x[3] for x in visible[:topk]]
+        self.current_target_dist = float(visible[0][1])
+        return selected, self.current_target_dist
 
     def _shape_reward(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
         reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
