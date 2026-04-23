@@ -36,6 +36,9 @@ class Preprocessor:
         self.prev_last_action = -1
         self.treasure_memory = {}
         self.current_target_dist = None
+        self.current_target_pos = None
+        self.prev_target_dist = None
+        self.target_lock_steps = 0
 
     def feature_process(self, env_obs, last_action):
         self.step_no += 1
@@ -67,6 +70,12 @@ class Preprocessor:
 
         legal_action = self._extract_legal_action(observation.get("legal_action", None))
         legal_action = self._apply_obstacle_action_mask(legal_action=legal_action, passable=passable)
+        legal_action = self._apply_treasure_direction_bias(
+            legal_action=legal_action,
+            hero_pos=hero_pos,
+            target_pos=self.current_target_pos,
+            nearest_monster_dist=nearest_monster_dist,
+        )
         scalar_feature = self._build_scalar_feature(
             env_info=env_info,
             hero=hero,
@@ -124,6 +133,7 @@ class Preprocessor:
     def _rank_topk_treasures(self, treasures, hero_pos, monsters):
         if hero_pos is None:
             self.current_target_dist = None
+            self.current_target_pos = None
             return treasures, None
 
         current_step = int(self.step_no)
@@ -195,18 +205,23 @@ class Preprocessor:
 
             if not memory_candidates:
                 self.current_target_dist = None
+                self.current_target_pos = None
                 return treasures, None
 
             memory_candidates.sort(key=lambda x: (-x[0], x[1]))
             topk = max(1, int(self.treasure_topk))
             selected = [x[2] for x in memory_candidates[:topk]]
             self.current_target_dist = float(memory_candidates[0][1])
+            pos0 = self._extract_pos(selected[0])
+            self.current_target_pos = None if pos0 is None else (int(pos0[0]), int(pos0[1]))
             return selected, self.current_target_dist
 
         visible.sort(key=lambda x: (-x[0], x[1]))
         topk = max(1, int(self.treasure_topk))
         selected = [x[2] for x in visible[:topk]]
         self.current_target_dist = float(visible[0][1])
+        pos0 = self._extract_pos(selected[0])
+        self.current_target_pos = None if pos0 is None else (int(pos0[0]), int(pos0[1]))
         return selected, self.current_target_dist
 
     def _treasure_priority_score(self, dist, is_new, recency, value, risk):
@@ -235,6 +250,9 @@ class Preprocessor:
         return max(0.0, Config.DANGER_DISTANCE + 1.0 - float(nearest))
 
     def _shape_reward(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
+        if bool(getattr(Config, "SIMPLE_TRAINING_MODE", False)):
+            return self._shape_reward_simple(env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action)
+
         reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
         post_accel = self.step_no >= int(Config.MONSTER_ACCEL_STEP)
         escape_phase_scale = float(Config.ESCAPE_WEIGHT_AFTER_ACCEL) if post_accel else 1.0
@@ -274,6 +292,20 @@ class Preprocessor:
                     Config.TREASURE_NEAR_RADIUS - nearest_treasure_dist + 1.0
                 )
             moved_on_target = moved_on_target or abs(delta_t) > 1e-6
+
+        if self.prev_target_dist is not None and self.current_target_dist is not None:
+            delta_target = self.prev_target_dist - self.current_target_dist
+            reward += Config.REWARD_TARGET_TRACK_PROGRESS * delta_target
+            if delta_target < -1e-6:
+                reward += Config.REWARD_TARGET_TRACK_AWAY_PENALTY * min(2.0, abs(delta_target))
+            if abs(delta_target) <= 1e-6:
+                self.target_lock_steps += 1
+            else:
+                self.target_lock_steps = 0
+            if self.target_lock_steps >= 2 and self.current_target_dist <= Config.TREASURE_NEAR_RADIUS + 1.0:
+                reward += Config.REWARD_TARGET_LOCK_BONUS
+        else:
+            self.target_lock_steps = 0
 
         if self.prev_monster_dist is not None and nearest_monster_dist is not None:
             delta_m = nearest_monster_dist - self.prev_monster_dist
@@ -318,6 +350,64 @@ class Preprocessor:
 
         self.prev_last_action = -1 if last_action is None else int(last_action)
         self.prev_treasure_dist = nearest_treasure_dist
+        self.prev_target_dist = self.current_target_dist
+        self.prev_monster_dist = nearest_monster_dist
+        return reward
+
+    def _shape_reward_simple(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
+        reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
+
+        treasure_score = float(self._safe_get(env_info, ["treasure_score", "score"], self.prev_treasure_score))
+        treasure_score_delta = max(0.0, treasure_score - self.prev_treasure_score)
+        self.prev_treasure_score = treasure_score
+
+        treasure_count = int(self._safe_get(env_info, ["treasures_collected"], self.prev_treasure_count))
+        treasure_count_delta = max(0, treasure_count - self.prev_treasure_count)
+        self.prev_treasure_count = treasure_count
+
+        reward += Config.REWARD_TREASURE_PICKUP * float(treasure_count_delta)
+        reward += 0.5 * Config.REWARD_TREASURE_PICKUP * float(treasure_score_delta)
+
+        if self.prev_target_dist is not None and self.current_target_dist is not None:
+            delta_target = self.prev_target_dist - self.current_target_dist
+            reward += Config.REWARD_SIMPLE_TARGET_PROGRESS * delta_target
+            if delta_target < -1e-6:
+                reward += Config.REWARD_SIMPLE_TARGET_AWAY_PENALTY * min(2.0, abs(delta_target))
+
+        if self.prev_monster_dist is not None and nearest_monster_dist is not None:
+            danger_level = self._danger_level(nearest_monster_dist)
+            delta_m = nearest_monster_dist - self.prev_monster_dist
+            if danger_level > 0.35:
+                reward += Config.REWARD_SIMPLE_ESCAPE_PROGRESS * delta_m
+
+        if nearest_monster_dist is not None:
+            danger_depth = max(0.0, Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
+            reward += Config.REWARD_SIMPLE_DANGER_PENALTY * danger_depth
+
+        if self.prev_target_dist is not None and self.current_target_dist is not None and abs(self.prev_target_dist - self.current_target_dist) > 1e-6:
+            self.stagnation_steps = 0
+        else:
+            self.stagnation_steps += 1
+            if self.stagnation_steps >= Config.STAGNATION_STEPS:
+                reward += Config.REWARD_SIMPLE_STAGNATION
+
+        if self.same_pos_steps >= Config.STUCK_STEPS:
+            stuck_scale = min(3.0, float(self.same_pos_steps) / float(Config.STUCK_STEPS))
+            reward += Config.REWARD_STUCK_PENALTY * stuck_scale
+            if 0 <= int(last_action) < 8 and int(last_action) == int(self.prev_last_action):
+                reward += Config.REWARD_REPEAT_ACTION_STUCK
+
+        used_flash = last_action is not None and 8 <= int(last_action) < Config.ACTION_NUM
+        danger_level = self._danger_level(nearest_monster_dist)
+        flash_legal = bool(np.sum(np.asarray(legal_action[8:16], dtype=np.float32)) > 0)
+        if used_flash and danger_level <= 0.2:
+            reward += Config.REWARD_FLASH_WASTE_SAFE
+        elif (not used_flash) and flash_legal and danger_level >= 0.75:
+            reward += 0.2 * Config.REWARD_FLASH_WASTE_SAFE
+
+        self.prev_last_action = -1 if last_action is None else int(last_action)
+        self.prev_treasure_dist = nearest_treasure_dist
+        self.prev_target_dist = self.current_target_dist
         self.prev_monster_dist = nearest_monster_dist
         return reward
 
@@ -812,6 +902,50 @@ class Preprocessor:
             flash_mask[:] = 1.0
 
         return move_mask, flash_mask
+
+    def _apply_treasure_direction_bias(self, legal_action, hero_pos, target_pos, nearest_monster_dist):
+        arr = np.asarray(legal_action, dtype=np.float32).reshape(-1)
+        if arr.size < Config.ACTION_NUM:
+            pad = np.ones(Config.ACTION_NUM - arr.size, dtype=np.float32)
+            arr = np.concatenate([arr, pad], axis=0)
+        arr = arr[: Config.ACTION_NUM]
+
+        if not Config.ENABLE_TREASURE_DIRECTION_BIAS:
+            return arr.tolist()
+        if hero_pos is None or target_pos is None:
+            return arr.tolist()
+
+        danger = self._danger_level(nearest_monster_dist)
+        if danger >= float(Config.TREASURE_DIRECTION_BIAS_DANGER_GATE):
+            return arr.tolist()
+
+        hx, hz = int(hero_pos[0]), int(hero_pos[1])
+        tx, tz = int(target_pos[0]), int(target_pos[1])
+        base_dist = float(abs(tx - hx) + abs(tz - hz))
+        if base_dist <= 1e-6:
+            return arr.tolist()
+
+        dirs = list(getattr(Config, "ACTION_MOVE_DIRS", []))
+        if len(dirs) < 8:
+            dirs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)]
+
+        improve = np.zeros(8, dtype=np.float32)
+        for i in range(8):
+            dx, dz = int(dirs[i][0]), int(dirs[i][1])
+            nd = float(abs(tx - (hx + dx)) + abs(tz - (hz + dz)))
+            imp = np.clip((base_dist - nd) / max(1.0, base_dist), -1.0, 1.0)
+            improve[i] = imp
+
+        strength = float(np.clip(Config.TREASURE_DIRECTION_BIAS_STRENGTH, 0.0, 1.0))
+        move_gate = 1.0 + strength * np.clip(improve, 0.0, 1.0)
+        flash_gate = 1.0 + 0.7 * strength * np.clip(improve, 0.0, 1.0)
+
+        arr[:8] = arr[:8] * move_gate
+        arr[8:16] = arr[8:16] * flash_gate
+
+        if float(np.sum(arr)) <= 1e-6:
+            return legal_action
+        return arr.tolist()
 
     def _safe_get(self, obj, keys, default):
         if not isinstance(obj, dict):

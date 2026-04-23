@@ -121,8 +121,21 @@ class Agent(BaseAgent):
         加载模型检查点。
         """
         model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
-        self.model.load_state_dict(torch.load(model_file_path, map_location=self.device))
-        self.logger.info(f"load model {model_file_path} successfully")
+        try:
+            ckpt = torch.load(model_file_path, map_location=self.device)
+            model_state = self.model.state_dict()
+            compatible = {
+                k: v
+                for k, v in ckpt.items()
+                if k in model_state and hasattr(v, "shape") and hasattr(model_state[k], "shape") and v.shape == model_state[k].shape
+            }
+            model_state.update(compatible)
+            self.model.load_state_dict(model_state)
+            self.logger.info(
+                f"load model {model_file_path} partially: matched {len(compatible)}/{len(model_state)} params"
+            )
+        except Exception as e:
+            self.logger.warning(f"load model failed for {model_file_path}, train from scratch. err={e}")
 
     def action_process(self, act_data, is_stochastic=True):
         """Unpack ActData to int action and update last_action.
