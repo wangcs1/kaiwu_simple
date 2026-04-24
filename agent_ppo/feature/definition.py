@@ -4,28 +4,49 @@
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-Author: Tencent AI Arena Authors
+Data definitions and GAE computation for Gorge Chase PPO (refactored).
 
-Data definitions, GAE computation for Gorge Chase PPO.
-峡谷追猎 PPO 数据类定义与 GAE 计算。
+数据类定义与 GAE 计算（重构版）。
+
+设计：
+  - ObsData 携带两份观测：map_tensor 与 sym_feat；另含 rule_hints（不进网络）
+  - SampleData 的 map_tensor 以扁平 1D 存储（MAP_FLAT_LEN），便于框架序列化
+    模型 forward 时再 reshape 回 (C, H, W)
+  - SampleData 的所有字段都用 1D 整数维度声明，框架按 create_cls 规约自动处理序列化
+    （不需要手写 SampleData2NumpyData / NumpyData2SampleData）
 """
 
 import numpy as np
-from common_python.utils.common_func import create_cls, attached
+
+from common_python.utils.common_func import create_cls
 from agent_ppo.conf.conf import Config
 
 
-# ObsData: flattened map+scalar feature, legal_action mask / 展平特征与合法动作掩码
-ObsData = create_cls("ObsData", feature=None, legal_action=None)
+# ObsData: map_tensor=(C,H,W), sym_feat=(SYM_FEATURE_LEN,), legal_action=(16,)
+ObsData = create_cls(
+    "ObsData",
+    map_tensor=None,
+    sym_feat=None,
+    legal_action=None,
+    rule_hints=None,
+)
 
-# ActData: action, d_action(greedy), prob, value / 动作、贪心动作、概率、价值
-ActData = create_cls("ActData", action=None, d_action=None, prob=None, value=None)
+# ActData: action(final), d_action(greedy), prob(16D), value, rl_action(pre-rule for logging)
+ActData = create_cls(
+    "ActData",
+    action=None,
+    d_action=None,
+    prob=None,
+    value=None,
+    rl_action=None,
+)
 
-# SampleData: single-frame sample with int dims / 单帧样本（整数表示维度）
+# SampleData: flat storage for distributed transfer
 SampleData = create_cls(
     "SampleData",
-    obs=Config.DIM_OF_OBSERVATION,
-    legal_action=Config.ACTION_NUM,
+    map_tensor=Config.MAP_FLAT_LEN,      # 6*21*21 = 2646
+    sym_feat=Config.SYM_FEATURE_LEN,     # 110
+    legal_action=Config.ACTION_NUM,      # 16
     act=1,
     reward=Config.VALUE_NUM,
     reward_sum=Config.VALUE_NUM,
@@ -33,7 +54,7 @@ SampleData = create_cls(
     value=Config.VALUE_NUM,
     next_value=Config.VALUE_NUM,
     advantage=Config.VALUE_NUM,
-    prob=Config.ACTION_NUM,
+    prob=Config.ACTION_NUM,              # 16
 )
 
 
@@ -43,15 +64,7 @@ def sample_process(list_sample_data):
     填充 next_value 并使用 GAE 计算优势函数。
     """
     for i in range(len(list_sample_data) - 1):
-        done_flag = float(np.asarray(list_sample_data[i].done, dtype=np.float32).reshape(-1)[0])
-        if done_flag > 0.5:
-            list_sample_data[i].next_value = np.zeros_like(list_sample_data[i].value, dtype=np.float32)
-        else:
-            list_sample_data[i].next_value = np.asarray(list_sample_data[i + 1].value, dtype=np.float32)
-
-    if list_sample_data:
-        list_sample_data[-1].next_value = np.zeros_like(np.asarray(list_sample_data[-1].value, dtype=np.float32))
-
+        list_sample_data[i].next_value = list_sample_data[i + 1].value
     _calc_gae(list_sample_data)
     return list_sample_data
 
@@ -61,17 +74,13 @@ def _calc_gae(list_sample_data):
 
     计算广义优势估计（GAE）。
     """
-    gae = np.zeros((Config.VALUE_NUM,), dtype=np.float32)
     gamma = Config.GAMMA
     lamda = Config.LAMDA
+    gae = 0.0
     for sample in reversed(list_sample_data):
-        reward = np.asarray(sample.reward, dtype=np.float32)
-        value = np.asarray(sample.value, dtype=np.float32)
-        next_value = np.asarray(sample.next_value, dtype=np.float32)
-        done = float(np.asarray(sample.done, dtype=np.float32).reshape(-1)[0])
-        non_terminal = 1.0 - np.clip(done, 0.0, 1.0)
-
-        delta = reward + gamma * next_value * non_terminal - value
-        gae = delta + gamma * lamda * non_terminal * gae
+        done = float(np.asarray(sample.done).reshape(-1)[0])
+        non_terminal = 1.0 - done
+        delta = -sample.value + sample.reward + gamma * sample.next_value * non_terminal
+        gae = gae * gamma * lamda * non_terminal + delta
         sample.advantage = gae
-        sample.reward_sum = gae + value
+        sample.reward_sum = gae + sample.value

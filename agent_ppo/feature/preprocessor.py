@@ -1,980 +1,756 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-Author: Tencent AI Arena Authors
-
-Feature preprocessor and reward design for Gorge Chase PPO.
-峡谷追猎 PPO 特征预处理与奖励设计。
+Feature preprocessing and reward shaping for Gorge Chase PPO.
 """
 
 import numpy as np
 
 from agent_ppo.conf.conf import Config
+from agent_ppo.feature import bfs as bfs_mod
+
+
+def _clip01(v):
+    return float(max(0.0, min(1.0, v)))
+
+
+def _norm(v, v_max, v_min=0.0):
+    if v_max - v_min <= 1e-6:
+        return 0.0
+    return _clip01((float(v) - v_min) / (v_max - v_min))
+
+
+def _lerp(a, b, t):
+    return a * (1.0 - t) + b * t
 
 
 class Preprocessor:
-    def __init__(self, treasure_topk=None):
-        self.treasure_topk = int(treasure_topk if treasure_topk is not None else Config.TREASURE_TARGET_TOPK)
+    def __init__(self):
         self.reset()
 
     def reset(self):
         self.step_no = 0
-        self.prev_treasure_dist = None
-        self.prev_monster_dist = None
-        self.prev_treasure_score = 0.0
-        self.prev_treasure_count = 0
-        self.prev_buff_count = 0
-        self.stagnation_steps = 0
-        self.global_visit_counts = {}
-        self.current_novelty = 1.0
-        self.prev_monster_positions = {}
-        self.prev_hero_pos = None
-        self.same_pos_steps = 0
-        self.prev_last_action = -1
-        self.treasure_memory = {}
-        self.current_target_dist = None
-        self.current_target_pos = None
-        self.prev_target_dist = None
-        self.target_lock_steps = 0
+        self.max_step = 1000
+
+        self.last_treasures_collected = 0
+        self.last_collected_buff = 0
+        self.last_flash_count = 0
+
+        self.last_hero_pos = None
+        self.last_monster_pos = {}
+        self.trajectory = []
+        self.position_history = []
+
+        self.last_potential = 0.0
+        self.last_min_monster_bfs = Config.BFS_MAX_STEPS
+
+        self.view_h = Config.MAP_VIEW
+        self.view_w = Config.MAP_VIEW
+        self.wall_bump_count = 0
+
+        self.seen_treasure_positions = set()
+        self.cached_treasure_positions = set()
 
     def feature_process(self, env_obs, last_action):
-        self.step_no += 1
-        observation = env_obs.get("observation", env_obs)
-        frame_state = observation.get("frame_state", {})
-        env_info = observation.get("env_info", {})
+        observation = env_obs["observation"]
+        frame_state = observation["frame_state"]
+        env_info = observation["env_info"]
+        map_info_raw = observation.get("map_info", None)
+        legal_act_raw = observation.get("legal_action", None)
 
-        hero = self._extract_hero(frame_state)
-        hero_pos = self._extract_pos(hero)
+        self.step_no = int(observation.get("step_no", env_info.get("step_no", 0)))
+        self.max_step = int(env_info.get("max_step", 1000))
 
-        passable = self._extract_map_passable(observation)
-        treasures, buffs, organ_debug = self._extract_organs(frame_state)
-        monsters = self._extract_monsters(frame_state)
+        map_grid = self._normalize_map(map_info_raw)
+        h, w = map_grid.shape
+        self.view_h, self.view_w = h, w
+        center_x = w // 2
+        center_z = h // 2
 
-        ranked_treasures, nearest_treasure_dist = self._rank_topk_treasures(treasures, hero_pos, monsters)
-        tracked_treasures = self._build_treasure_debug_topk(ranked_treasures, hero_pos)
+        hero = frame_state.get("heroes", {}) or {}
+        if isinstance(hero, list):
+            hero = hero[0] if hero else {}
+        hero_pos = hero.get("pos", {}) or {}
+        hero_global_x = int(hero_pos.get("x", 0))
+        hero_global_z = int(hero_pos.get("z", 0))
 
-        treasure_layer, _ = self._entity_layer(ranked_treasures, hero_pos, decay=0.0)
-        buff_layer, nearest_buff_dist = self._entity_layer(buffs, hero_pos, decay=0.0)
-        monster_layer, nearest_monster_dist = self._entity_layer(monsters, hero_pos, decay=0.0)
-        danger_layer, _ = self._entity_layer(monsters, hero_pos, decay=0.20)
-        predicted_danger = self._predict_monster_threat(monsters, hero_pos)
-        danger_layer = np.maximum(danger_layer, predicted_danger)
+        organs = frame_state.get("organs", []) or []
+        treasure_local = []
+        buff_local = []
+        for o in organs:
+            sub_type = int(o.get("sub_type", 0))
+            status = int(o.get("status", 0))
+            bucket = int(o.get("hero_l2_distance", 5))
+            dir_e = int(o.get("hero_relative_direction", 0))
+            opos = o.get("pos", {}) or {}
+            ox, oz = int(opos.get("x", 0)), int(opos.get("z", 0))
+            lx = ox - hero_global_x + center_x
+            lz = oz - hero_global_z + center_z
+            entry = (lx, lz, bucket, dir_e, status, ox, oz)
+            if sub_type == 1 and status == 1:
+                treasure_local.append(entry)
+            elif sub_type == 2 and status == 1:
+                buff_local.append(entry)
 
-        self._update_stuck_state(hero_pos)
-        visited_layer, self.current_novelty = self._build_visited_layer(hero_pos)
-
-        stacked = np.stack([passable, treasure_layer, buff_layer, monster_layer, danger_layer, visited_layer], axis=0)
-
-        legal_action = self._extract_legal_action(observation.get("legal_action", None))
-        legal_action = self._apply_obstacle_action_mask(legal_action=legal_action, passable=passable)
-        legal_action = self._apply_treasure_direction_bias(
-            legal_action=legal_action,
-            hero_pos=hero_pos,
-            target_pos=self.current_target_pos,
-            nearest_monster_dist=nearest_monster_dist,
-        )
-        scalar_feature = self._build_scalar_feature(
-            env_info=env_info,
-            hero=hero,
-            passable=passable,
-            legal_action=legal_action,
-            last_action=last_action,
-            nearest_treasure_dist=nearest_treasure_dist,
-            nearest_buff_dist=nearest_buff_dist,
-            nearest_monster_dist=nearest_monster_dist,
-            second_monster_dist=self._second_nearest_dist(monsters, hero_pos),
-            has_treasure=float(treasure_layer.sum()) > 0,
-            has_buff=float(buff_layer.sum()) > 0,
-            has_monster=float(monster_layer.sum()) > 0,
-        )
-
-        self.last_feature_debug = {
-            "step_no": int(self.step_no),
-            "treasure_source": organ_debug.get("source", "unknown"),
-            "treasure_count": int(len(ranked_treasures)),
-            "visible_treasure_count": int(len(treasures)),
-            "buff_count": int(len(buffs)),
-            "nearest_treasure_dist": None if nearest_treasure_dist is None else float(nearest_treasure_dist),
-            "target_treasure_dist": None if self.current_target_dist is None else float(self.current_target_dist),
-            "treasure_layer_sum": float(treasure_layer.sum()),
-            "treasure_topk": [
-                {
-                    "id": int(t.get("id", -1)),
-                    "dist": None if t.get("dist", None) is None else float(t.get("dist", 0.0)),
-                    "seen_count": int(t.get("seen_count", 0)),
-                    "is_new": int(t.get("is_new", 0)),
-                    "pos": {
-                        "x": int(self._safe_get(t, ["x"], -1)),
-                        "z": int(self._safe_get(t, ["z"], -1)),
-                    },
-                }
-                for t in tracked_treasures
-            ],
+        treasure_in_view_set = {
+            (e[0], e[1]) for e in treasure_local if 0 <= e[0] < w and 0 <= e[1] < h
+        }
+        buff_in_view_set = {
+            (e[0], e[1]) for e in buff_local if 0 <= e[0] < w and 0 <= e[1] < h
         }
 
-        feature = np.concatenate([stacked.reshape(-1), scalar_feature], axis=0).astype(np.float32)
-        reward = [
-            float(
-                self._shape_reward(
-                    env_info=env_info,
-                    last_action=last_action,
-                    nearest_treasure_dist=nearest_treasure_dist,
-                    nearest_monster_dist=nearest_monster_dist,
-                    legal_action=legal_action,
-                )
-            )
-        ]
-        self._update_monster_memory(monsters)
-        return feature, legal_action, reward
+        monsters_raw = frame_state.get("monsters", []) or []
+        monsters = [monsters_raw[i] if i < len(monsters_raw) else None for i in range(2)]
 
-    def _rank_topk_treasures(self, treasures, hero_pos, monsters):
-        if hero_pos is None:
-            self.current_target_dist = None
-            self.current_target_pos = None
-            return treasures, None
+        rays = bfs_mod.compute_obstacle_rays(map_grid, center_x, center_z)
+        flash_landings = bfs_mod.compute_flash_landing(
+            map_grid, center_x, center_z, treasure_in_view_set, buff_in_view_set
+        )
+        movable_mask = bfs_mod.compute_movable_mask(map_grid, center_x, center_z)
+        flash_useful_mask = bfs_mod.compute_flash_useful_mask(flash_landings)
+        hero_dist_map, hero_first_dir_map = bfs_mod.local_bfs(map_grid, center_x, center_z)
 
-        current_step = int(self.step_no)
-        visible = []
-        for t in treasures:
-            pos = self._extract_pos(t)
-            if pos is None:
+        reachable_treasure_set = set()
+        reachable_buff_set = set()
+        reachable_visible_treasure_globals = set()
+        has_unreachable_treasure_in_view = False
+        nearest_treasure_bfs = Config.BFS_MAX_STEPS
+        for (lx, lz, _bucket, _dir_e, _status, gx, gz) in treasure_local:
+            if not (0 <= lx < w and 0 <= lz < h):
                 continue
+            d = int(hero_dist_map[lz, lx])
+            if d >= 0:
+                reachable_treasure_set.add((lx, lz))
+                reachable_visible_treasure_globals.add((gx, gz))
+                nearest_treasure_bfs = min(nearest_treasure_bfs, d)
+            else:
+                has_unreachable_treasure_in_view = True
+        for (lx, lz) in buff_in_view_set:
+            if 0 <= lx < w and 0 <= lz < h and int(hero_dist_map[lz, lx]) >= 0:
+                reachable_buff_set.add((lx, lz))
 
-            key = (int(pos[0]), int(pos[1]))
-            item = self.treasure_memory.get(key)
-            if item is None:
-                item = {
-                    "first_seen": current_step,
-                    "last_seen": current_step,
-                    "seen_count": 0,
-                }
-            item["seen_count"] = int(item.get("seen_count", 0)) + 1
-            item["last_seen"] = current_step
-            item["last_pos"] = pos
-            item["value"] = max(float(item.get("value", 0.0)), self._treasure_value(t))
-            self.treasure_memory[key] = item
-
-            dist = float(abs(pos[0] - hero_pos[0]) + abs(pos[1] - hero_pos[1]))
-            is_new = 1 if item["seen_count"] <= Config.TREASURE_NEW_SEEN_COUNT else 0
-            score = self._treasure_priority_score(
-                dist=dist,
-                is_new=is_new,
-                recency=(current_step - int(item.get("last_seen", current_step))),
-                value=float(item.get("value", 0.0)),
-                risk=self._treasure_risk(pos, monsters),
-            )
-            visible.append((score, dist, t))
-
-        ttl = int(Config.TREASURE_MEMORY_TTL)
-        stale_keys = [
-            k for k, v in self.treasure_memory.items() if (current_step - int(v.get("last_seen", current_step))) > ttl
-        ]
-        for key in stale_keys:
-            self.treasure_memory.pop(key, None)
-
-        if not visible:
-            memory_candidates = []
-            for key, item in self.treasure_memory.items():
-                pos = item.get("last_pos", key)
-                if not isinstance(pos, tuple) or len(pos) != 2:
-                    continue
-                dist = float(abs(pos[0] - hero_pos[0]) + abs(pos[1] - hero_pos[1]))
-                recency = float(current_step - int(item.get("last_seen", current_step)))
-                is_new = 1 if int(item.get("seen_count", 0)) <= Config.TREASURE_NEW_SEEN_COUNT else 0
-                score = self._treasure_priority_score(
-                    dist=dist,
-                    is_new=is_new,
-                    recency=recency,
-                    value=float(item.get("value", 0.0)),
-                    risk=self._treasure_risk(pos, monsters),
-                )
-                memory_candidates.append(
-                    (
-                        score,
-                        dist,
-                        {
-                            "pos": {"x": int(pos[0]), "z": int(pos[1])},
-                            "organ_id": -1,
-                            "name": "memory_treasure",
-                        },
-                    )
-                )
-
-            if not memory_candidates:
-                self.current_target_dist = None
-                self.current_target_pos = None
-                return treasures, None
-
-            memory_candidates.sort(key=lambda x: (-x[0], x[1]))
-            topk = max(1, int(self.treasure_topk))
-            selected = [x[2] for x in memory_candidates[:topk]]
-            self.current_target_dist = float(memory_candidates[0][1])
-            pos0 = self._extract_pos(selected[0])
-            self.current_target_pos = None if pos0 is None else (int(pos0[0]), int(pos0[1]))
-            return selected, self.current_target_dist
-
-        visible.sort(key=lambda x: (-x[0], x[1]))
-        topk = max(1, int(self.treasure_topk))
-        selected = [x[2] for x in visible[:topk]]
-        self.current_target_dist = float(visible[0][1])
-        pos0 = self._extract_pos(selected[0])
-        self.current_target_pos = None if pos0 is None else (int(pos0[0]), int(pos0[1]))
-        return selected, self.current_target_dist
-
-    def _treasure_priority_score(self, dist, is_new, recency, value, risk):
-        return (
-            Config.TREASURE_RANK_NEW_BONUS * float(is_new)
-            - Config.TREASURE_RANK_DIST_WEIGHT * float(dist)
-            - Config.TREASURE_RANK_RISK_WEIGHT * float(risk)
-            - Config.TREASURE_RANK_RECENCY_WEIGHT * float(recency)
-            + Config.TREASURE_RANK_VALUE_WEIGHT * float(value)
+        map_tensor = self._build_map_tensor(
+            map_grid,
+            reachable_treasure_set,
+            reachable_buff_set,
+            monsters,
+            hero_global_x,
+            hero_global_z,
+            center_x,
+            center_z,
         )
 
-    def _treasure_risk(self, target_pos, monsters):
-        if target_pos is None or not monsters:
-            return 0.0
+        sym_feat, dead_end_score = self._build_sym_feat(
+            hero=hero,
+            env_info=env_info,
+            monsters=monsters,
+            treasure_local=treasure_local,
+            buff_local=buff_local,
+            remembered_treasures=self.cached_treasure_positions,
+            hero_global=(hero_global_x, hero_global_z),
+            center=(center_x, center_z),
+            map_grid=map_grid,
+            hero_dist_map=hero_dist_map,
+            rays=rays,
+            flash_landings=flash_landings,
+            movable_mask=movable_mask,
+            flash_useful_mask=flash_useful_mask,
+            last_action=last_action,
+        )
 
-        nearest = None
-        for monster in monsters:
-            mpos = self._extract_pos(monster)
-            if mpos is None:
+        flash_cd = int(hero.get("flash_cooldown", 0))
+        flash_ready = 1 if flash_cd <= 0 else 0
+        env_flash_mask = self._parse_env_flash_mask(legal_act_raw)
+        legal_action_16d = self._build_legal_16(
+            movable_mask, flash_ready, flash_useful_mask, env_flash_mask
+        )
+
+        cur_treasures_collected = int(env_info.get("treasures_collected", 0))
+        cur_collected_buff = int(env_info.get("collected_buff", 0))
+        cur_flash_count = int(env_info.get("flash_count", 0))
+        picked_treasure = cur_treasures_collected > self.last_treasures_collected
+        picked_buff = cur_collected_buff > self.last_collected_buff
+        used_flash = cur_flash_count > self.last_flash_count
+
+        newly_seen_treasures = reachable_visible_treasure_globals - self.seen_treasure_positions
+        first_seen_treasure_count = len(newly_seen_treasures)
+
+        bumped_wall = False
+        if (
+            self.last_hero_pos is not None
+            and last_action is not None
+            and 0 <= int(last_action) <= 7
+            and (hero_global_x, hero_global_z) == self.last_hero_pos
+        ):
+            bumped_wall = True
+            self.wall_bump_count += 1
+
+        min_monster_bfs = Config.BFS_MAX_STEPS
+        monster_bfs_dists = [Config.BFS_MAX_STEPS, Config.BFS_MAX_STEPS]
+        visible_monster_count = 0
+        for mi, m in enumerate(monsters):
+            if m is None or int(m.get("is_in_view", 0)) == 0:
                 continue
-            md = float(abs(mpos[0] - target_pos[0]) + abs(mpos[1] - target_pos[1]))
-            nearest = md if nearest is None else min(nearest, md)
+            visible_monster_count += 1
+            mpos = m.get("pos", {}) or {}
+            mx, mz = int(mpos.get("x", 0)), int(mpos.get("z", 0))
+            lx = mx - hero_global_x + center_x
+            lz = mz - hero_global_z + center_z
+            if 0 <= lx < w and 0 <= lz < h:
+                d = int(hero_dist_map[lz, lx])
+                if d >= 0:
+                    monster_bfs_dists[mi] = d
+                    min_monster_bfs = min(min_monster_bfs, d)
 
-        if nearest is None:
-            return 0.0
-        return max(0.0, Config.DANGER_DISTANCE + 1.0 - float(nearest))
-
-    def _shape_reward(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
-        if bool(getattr(Config, "SIMPLE_TRAINING_MODE", False)):
-            return self._shape_reward_simple(env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action)
-
-        reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
-        post_accel = self.step_no >= int(Config.MONSTER_ACCEL_STEP)
-        escape_phase_scale = float(Config.ESCAPE_WEIGHT_AFTER_ACCEL) if post_accel else 1.0
-        danger_penalty_scale = float(Config.MONSTER_PENALTY_AFTER_ACCEL) if post_accel else 1.0
-
-        treasure_score = float(self._safe_get(env_info, ["treasure_score", "score"], self.prev_treasure_score))
-        treasure_score_delta = max(0.0, treasure_score - self.prev_treasure_score)
-        self.prev_treasure_score = treasure_score
-
-        treasure_count = int(self._safe_get(env_info, ["treasures_collected"], self.prev_treasure_count))
-        treasure_count_delta = max(0, treasure_count - self.prev_treasure_count)
-        self.prev_treasure_count = treasure_count
-
-        buff_count = int(self._safe_get(env_info, ["collected_buff"], self.prev_buff_count))
-        buff_count_delta = max(0, buff_count - self.prev_buff_count)
-        self.prev_buff_count = buff_count
-
-        reward += Config.REWARD_TREASURE_PICKUP * float(treasure_count_delta)
-        reward += Config.REWARD_TREASURE_PICKUP * 0.25 * treasure_score_delta
-        reward += Config.REWARD_BUFF_PICKUP * float(buff_count_delta)
-
-        danger_level = self._danger_level(nearest_monster_dist)
-        safe_level = 1.0 - danger_level
-
-        moved_on_target = False
-        if self.prev_treasure_dist is not None and nearest_treasure_dist is not None:
-            delta_t = self.prev_treasure_dist - nearest_treasure_dist
-            treasure_progress_weight = (
-                Config.REWARD_TREASURE_PROGRESS_BASE + Config.REWARD_TREASURE_PROGRESS_SAFE_GAIN * safe_level
+        opening_treasure_shield = (
+            self.step_no <= Config.OPENING_TREASURE_SHIELD_STEPS
+            and (
+                visible_monster_count == 0
+                or min_monster_bfs <= Config.OPENING_TREASURE_MONSTER_SAFE_DIST
             )
-            reward += treasure_progress_weight * delta_t
-            prev_potential = 1.0 / (self.prev_treasure_dist + 1.0)
-            curr_potential = 1.0 / (nearest_treasure_dist + 1.0)
-            reward += Config.REWARD_TREASURE_NEAR_PROGRESS * safe_level * (curr_potential - prev_potential)
-            if nearest_treasure_dist <= Config.TREASURE_NEAR_RADIUS:
-                reward += Config.REWARD_TREASURE_NEAR_BONUS * safe_level * (
-                    Config.TREASURE_NEAR_RADIUS - nearest_treasure_dist + 1.0
-                )
-            moved_on_target = moved_on_target or abs(delta_t) > 1e-6
+        )
 
-        if self.prev_target_dist is not None and self.current_target_dist is not None:
-            delta_target = self.prev_target_dist - self.current_target_dist
-            reward += Config.REWARD_TARGET_TRACK_PROGRESS * delta_target
-            if delta_target < -1e-6:
-                reward += Config.REWARD_TARGET_TRACK_AWAY_PENALTY * min(2.0, abs(delta_target))
-            if abs(delta_target) <= 1e-6:
-                self.target_lock_steps += 1
-            else:
-                self.target_lock_steps = 0
-            if self.target_lock_steps >= 2 and self.current_target_dist <= Config.TREASURE_NEAR_RADIUS + 1.0:
-                reward += Config.REWARD_TARGET_LOCK_BONUS
-        else:
-            self.target_lock_steps = 0
+        max_monster_speed = 1
+        for m in monsters:
+            if m is None:
+                continue
+            max_monster_speed = max(max_monster_speed, int(m.get("speed", 1)))
+        late_factor = _clip01((max_monster_speed - 1.0) / 1.0)
+        is_late_phase = late_factor > 0.5
 
-        if self.prev_monster_dist is not None and nearest_monster_dist is not None:
-            delta_m = nearest_monster_dist - self.prev_monster_dist
-            escape_progress_weight = Config.REWARD_ESCAPE_PROGRESS_BASE + Config.REWARD_ESCAPE_PROGRESS_DANGER_GAIN * danger_level
-            reward += escape_phase_scale * escape_progress_weight * delta_m
-            moved_on_target = moved_on_target or abs(delta_m) > 1e-6
+        flash_path_had_item = False
+        if used_flash and last_action is not None and 8 <= int(last_action) <= 15:
+            dir_idx = int(last_action) - 8
+            flash_path_had_item = flash_landings[dir_idx][2] > 0
 
-        if nearest_monster_dist is not None:
-            danger_depth = max(0.0, Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
-            reward += (
-                danger_penalty_scale
-                * Config.REWARD_MONSTER_PROXIMITY_PENALTY
-                * danger_depth
-                * (0.5 + danger_level)
-            )
+        monster_bfs_gain = int(min_monster_bfs - self.last_min_monster_bfs)
+        dead_end = dead_end_score > Config.DEAD_END_RATIO_THRESHOLD
 
-        if moved_on_target:
-            self.stagnation_steps = 0
-        else:
-            self.stagnation_steps += 1
-            if self.stagnation_steps >= Config.STAGNATION_STEPS:
-                reward += Config.REWARD_STAGNATION_PENALTY
+        is_lingering = False
+        if (
+            self.step_no <= Config.LINGER_STEP_LIMIT
+            and len(self.position_history) >= Config.LINGER_WINDOW
+        ):
+            old_x, old_z = self.position_history[-Config.LINGER_WINDOW]
+            linger_dist = float(np.hypot(hero_global_x - old_x, hero_global_z - old_z))
+            is_lingering = linger_dist < Config.LINGER_L2_THRESHOLD
 
-        reward += Config.REWARD_EXPLORATION * self.current_novelty * (0.5 + 0.5 * safe_level)
+        flash_escape_scores = self._compute_flash_escape_scores(
+            map_grid=map_grid,
+            monsters=monsters,
+            hero_global=(hero_global_x, hero_global_z),
+            center=(center_x, center_z),
+            flash_landings=flash_landings,
+        )
 
-        if self.same_pos_steps >= Config.STUCK_STEPS:
-            stuck_scale = min(3.0, float(self.same_pos_steps) / float(Config.STUCK_STEPS))
-            reward += Config.REWARD_STUCK_PENALTY * stuck_scale
-            if 0 <= int(last_action) < 8 and int(last_action) == int(self.prev_last_action):
-                reward += Config.REWARD_REPEAT_ACTION_STUCK
+        reward = self._compute_reward(
+            picked_treasure=picked_treasure,
+            picked_buff=picked_buff,
+            used_flash=used_flash,
+            flash_path_had_item=flash_path_had_item,
+            monster_bfs_gain=monster_bfs_gain,
+            bumped_wall=bumped_wall,
+            dead_end=dead_end,
+            late_factor=late_factor,
+            nearest_treasure_bfs=nearest_treasure_bfs,
+            min_monster_bfs=min_monster_bfs,
+            first_seen_treasure_count=first_seen_treasure_count,
+            opening_treasure_shield=opening_treasure_shield,
+            has_unreachable_treasure_in_view=has_unreachable_treasure_in_view,
+            is_lingering=is_lingering,
+        )
 
-        # Encourage flash for danger escape, punish blind flash.
-        used_flash = last_action is not None and last_action >= 8 and last_action < Config.ACTION_NUM
-        flash_legal = bool(np.sum(np.asarray(legal_action[8:16], dtype=np.float32)) > 0)
-        if used_flash:
-            if danger_level >= 0.4 and self.prev_monster_dist is not None and nearest_monster_dist > self.prev_monster_dist:
-                reward += Config.REWARD_FLASH_ESCAPE * (1.0 + 0.5 * danger_level)
-            elif danger_level <= 0.2:
-                reward += Config.REWARD_FLASH_WASTE_SAFE
-        elif flash_legal and danger_level >= 0.7:
-            reward += 0.4 * Config.REWARD_FLASH_WASTE_SAFE
+        self.last_treasures_collected = cur_treasures_collected
+        self.last_collected_buff = cur_collected_buff
+        self.last_flash_count = cur_flash_count
+        self.last_hero_pos = (hero_global_x, hero_global_z)
+        self.last_min_monster_bfs = min_monster_bfs
 
-        self.prev_last_action = -1 if last_action is None else int(last_action)
-        self.prev_treasure_dist = nearest_treasure_dist
-        self.prev_target_dist = self.current_target_dist
-        self.prev_monster_dist = nearest_monster_dist
-        return reward
+        self.seen_treasure_positions.update(newly_seen_treasures)
+        self.cached_treasure_positions.update(reachable_visible_treasure_globals)
+        if picked_treasure:
+            self._consume_cached_treasure(hero_global_x, hero_global_z)
 
-    def _shape_reward_simple(self, env_info, last_action, nearest_treasure_dist, nearest_monster_dist, legal_action):
-        reward = Config.REWARD_STEP_SURVIVE + Config.REWARD_STEP_PENALTY
+        for mi, m in enumerate(monsters):
+            if m is None:
+                continue
+            mpos = m.get("pos", {}) or {}
+            self.last_monster_pos[mi] = (int(mpos.get("x", 0)), int(mpos.get("z", 0)))
 
-        treasure_score = float(self._safe_get(env_info, ["treasure_score", "score"], self.prev_treasure_score))
-        treasure_score_delta = max(0.0, treasure_score - self.prev_treasure_score)
-        self.prev_treasure_score = treasure_score
+        self.trajectory.append((hero_global_x, hero_global_z))
+        self.position_history.append((hero_global_x, hero_global_z))
+        max_hist = max(Config.TRAJECTORY_LEN, Config.LINGER_WINDOW, Config.POSITION_HISTORY_WINDOW)
+        if len(self.trajectory) > max_hist:
+            self.trajectory.pop(0)
+        if len(self.position_history) > max_hist:
+            self.position_history.pop(0)
 
-        treasure_count = int(self._safe_get(env_info, ["treasures_collected"], self.prev_treasure_count))
-        treasure_count_delta = max(0, treasure_count - self.prev_treasure_count)
-        self.prev_treasure_count = treasure_count
+        monster_dirs = []
+        for m in monsters:
+            if m is None or int(m.get("is_in_view", 0)) == 0:
+                monster_dirs.append(-1)
+                continue
+            mpos = m.get("pos", {}) or {}
+            mx, mz = int(mpos.get("x", 0)), int(mpos.get("z", 0))
+            lx = mx - hero_global_x + center_x
+            lz = mz - hero_global_z + center_z
+            first_dir = -1
+            if 0 <= lx < w and 0 <= lz < h:
+                first_dir = int(hero_first_dir_map[lz, lx])
+            monster_dirs.append(first_dir)
 
-        reward += Config.REWARD_TREASURE_PICKUP * float(treasure_count_delta)
-        reward += 0.5 * Config.REWARD_TREASURE_PICKUP * float(treasure_score_delta)
+        adjacent_treasure_dir = -1
+        for (lx, lz, _b, _d, _s, _gx, _gz) in treasure_local:
+            if not (0 <= lx < w and 0 <= lz < h):
+                continue
+            if int(hero_dist_map[lz, lx]) < 0:
+                continue
+            dx = lx - center_x
+            dz = lz - center_z
+            if max(abs(dx), abs(dz)) == 1 and (dx != 0 or dz != 0):
+                for k, (odx, odz) in enumerate(Config.DIR_OFFSETS):
+                    if odx == dx and odz == dz and movable_mask[k]:
+                        adjacent_treasure_dir = k
+                        break
+                if adjacent_treasure_dir != -1:
+                    break
 
-        if self.prev_target_dist is not None and self.current_target_dist is not None:
-            delta_target = self.prev_target_dist - self.current_target_dist
-            reward += Config.REWARD_SIMPLE_TARGET_PROGRESS * delta_target
-            if delta_target < -1e-6:
-                reward += Config.REWARD_SIMPLE_TARGET_AWAY_PENALTY * min(2.0, abs(delta_target))
+        rule_hints = {
+            "movable_mask": movable_mask,
+            "flash_useful_mask": flash_useful_mask,
+            "flash_ready": bool(flash_ready),
+            "adjacent_treasure_dir": adjacent_treasure_dir,
+            "monster_bfs_dists": monster_bfs_dists,
+            "monster_dirs": monster_dirs,
+            "is_late_phase": is_late_phase,
+            "flash_landings": flash_landings,
+            "flash_escape_scores": flash_escape_scores,
+            "opening_treasure_shield": opening_treasure_shield,
+            "step_no": self.step_no,
+        }
 
-        if self.prev_monster_dist is not None and nearest_monster_dist is not None:
-            danger_level = self._danger_level(nearest_monster_dist)
-            delta_m = nearest_monster_dist - self.prev_monster_dist
-            if danger_level > 0.35:
-                reward += Config.REWARD_SIMPLE_ESCAPE_PROGRESS * delta_m
+        return {
+            "map_tensor": map_tensor.astype(np.float32),
+            "sym_feat": sym_feat.astype(np.float32),
+            "legal_action_16d": legal_action_16d,
+            "movable_mask_8d": movable_mask,
+            "flash_useful_mask_8d": flash_useful_mask,
+            "reward": [float(reward)],
+            "rule_hints": rule_hints,
+        }
 
-        if nearest_monster_dist is not None:
-            danger_depth = max(0.0, Config.DANGER_DISTANCE - nearest_monster_dist + 1.0)
-            reward += Config.REWARD_SIMPLE_DANGER_PENALTY * danger_depth
-
-        if self.prev_target_dist is not None and self.current_target_dist is not None and abs(self.prev_target_dist - self.current_target_dist) > 1e-6:
-            self.stagnation_steps = 0
-        else:
-            self.stagnation_steps += 1
-            if self.stagnation_steps >= Config.STAGNATION_STEPS:
-                reward += Config.REWARD_SIMPLE_STAGNATION
-
-        if self.same_pos_steps >= Config.STUCK_STEPS:
-            stuck_scale = min(3.0, float(self.same_pos_steps) / float(Config.STUCK_STEPS))
-            reward += Config.REWARD_STUCK_PENALTY * stuck_scale
-            if 0 <= int(last_action) < 8 and int(last_action) == int(self.prev_last_action):
-                reward += Config.REWARD_REPEAT_ACTION_STUCK
-
-        used_flash = last_action is not None and 8 <= int(last_action) < Config.ACTION_NUM
-        danger_level = self._danger_level(nearest_monster_dist)
-        flash_legal = bool(np.sum(np.asarray(legal_action[8:16], dtype=np.float32)) > 0)
-        if used_flash and danger_level <= 0.2:
-            reward += Config.REWARD_FLASH_WASTE_SAFE
-        elif (not used_flash) and flash_legal and danger_level >= 0.75:
-            reward += 0.2 * Config.REWARD_FLASH_WASTE_SAFE
-
-        self.prev_last_action = -1 if last_action is None else int(last_action)
-        self.prev_treasure_dist = nearest_treasure_dist
-        self.prev_target_dist = self.current_target_dist
-        self.prev_monster_dist = nearest_monster_dist
-        return reward
-
-    def _update_stuck_state(self, hero_pos):
-        if hero_pos is None:
-            self.same_pos_steps = 0
-            self.prev_hero_pos = None
+    def _consume_cached_treasure(self, hero_x, hero_z):
+        if not self.cached_treasure_positions:
             return
-
-        if self.prev_hero_pos is not None and hero_pos == self.prev_hero_pos:
-            self.same_pos_steps += 1
-        else:
-            self.same_pos_steps = 0
-        self.prev_hero_pos = hero_pos
-
-    def _build_visited_layer(self, hero_pos):
-        layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
-        if hero_pos is None:
-            return layer, 1.0
-
-        center = Config.VIEW_SIZE // 2
-        hero_x, hero_z = int(hero_pos[0]), int(hero_pos[1])
-
-        for dz in range(-center, center + 1):
-            for dx in range(-center, center + 1):
-                key = (hero_x + dx, hero_z + dz)
-                count = float(self.global_visit_counts.get(key, 0.0))
-                layer[center + dz, center + dx] = np.clip(count / 4.0, 0.0, 1.0)
-
-        current_key = (hero_x, hero_z)
-        current_count = float(self.global_visit_counts.get(current_key, 0.0))
-        novelty = 1.0 / np.sqrt(current_count + 1.0)
-        self.global_visit_counts[current_key] = current_count + 1.0
-
-        return layer, float(novelty)
-
-    def _danger_level(self, nearest_monster_dist):
-        if nearest_monster_dist is None:
-            return 0.0
-        level = (Config.DANGER_DISTANCE - nearest_monster_dist) / max(1e-6, Config.DANGER_DISTANCE)
-        return float(np.clip(level, 0.0, 1.0))
-
-    def _build_scalar_feature(
-        self,
-        env_info,
-        hero,
-        passable,
-        legal_action,
-        last_action,
-        nearest_treasure_dist,
-        nearest_buff_dist,
-        nearest_monster_dist,
-        second_monster_dist,
-        has_treasure,
-        has_buff,
-        has_monster,
-    ):
-        max_view_dist = float(Config.VIEW_SIZE - 1) * 2.0
-
-        total_treasure = max(1.0, float(self._safe_get(env_info, ["total_treasure"], 1.0)))
-        treasures_collected = float(self._safe_get(env_info, ["treasures_collected"], 0.0))
-        total_buff = max(1.0, float(self._safe_get(env_info, ["total_buff"], 1.0)))
-        buffs_collected = float(self._safe_get(env_info, ["collected_buff"], 0.0))
-
-        flash_count = float(self._safe_get(env_info, ["flash_count"], 0.0))
-        flash_cooldown = float(self._safe_get(env_info, ["flash_cooldown"], 0.0))
-        max_step = max(1.0, float(self._safe_get(env_info, ["max_step"], 1.0)))
-
-        speed_left = float(self._safe_get(hero, ["speed_up_buff_left", "speed_buff_left", "buff_left"], 0.0))
-
-        last_action_norm = 0.0 if last_action is None or last_action < 0 else float(last_action) / float(Config.ACTION_NUM - 1)
-        treasure_dist_norm = 1.0 if nearest_treasure_dist is None else min(1.0, nearest_treasure_dist / max_view_dist)
-        buff_dist_norm = 1.0 if nearest_buff_dist is None else min(1.0, nearest_buff_dist / max_view_dist)
-        monster_dist_norm = 1.0 if nearest_monster_dist is None else min(1.0, nearest_monster_dist / max_view_dist)
-        second_monster_dist_norm = (
-            1.0 if second_monster_dist is None else min(1.0, second_monster_dist / max_view_dist)
+        nearest = min(
+            self.cached_treasure_positions,
+            key=lambda p: (np.hypot(hero_x - p[0], hero_z - p[1]), p[0], p[1]),
         )
-        danger_level = self._danger_level(nearest_monster_dist)
-        corridor_score = self._corridor_score(passable)
-        alive_space = self._alive_space_ratio(passable)
-        is_speed_stage = 1.0 if danger_level > 0.45 or second_monster_dist_norm < 0.5 else 0.0
+        if np.hypot(hero_x - nearest[0], hero_z - nearest[1]) <= 2.0:
+            self.cached_treasure_positions.discard(nearest)
 
-        legal_move_ratio = float(np.mean(np.asarray(legal_action[:8], dtype=np.float32)))
-        legal_flash_ratio = float(np.mean(np.asarray(legal_action[8:16], dtype=np.float32)))
-        flash_ready = 1.0 if float(flash_cooldown) <= 1e-5 and legal_flash_ratio > 0 else 0.0
-        recent_novelty = float(np.clip(self.current_novelty, 0.0, 1.0))
-
-        hero_state = np.array(
-            [
-                min(1.0, self.step_no / max_step),
-                min(1.0, speed_left / 50.0),
-                min(1.0, flash_count / 20.0),
-                min(1.0, flash_cooldown / 50.0),
-                flash_ready,
-            ],
-            dtype=np.float32,
-        )
-        treasure_state = np.array(
-            [
-                treasures_collected / total_treasure,
-                buffs_collected / total_buff,
-                treasure_dist_norm,
-                buff_dist_norm,
-                1.0 if has_treasure else 0.0,
-                1.0 if has_buff else 0.0,
-            ],
-            dtype=np.float32,
-        )
-        monster_state = np.array(
-            [
-                monster_dist_norm,
-                second_monster_dist_norm,
-                danger_level,
-                1.0 if has_monster else 0.0,
-                1.0 if second_monster_dist_norm < 0.45 else 0.0,
-            ],
-            dtype=np.float32,
-        )
-        mobility_state = np.array(
-            [
-                legal_move_ratio,
-                legal_flash_ratio,
-                corridor_score,
-                alive_space,
-            ],
-            dtype=np.float32,
-        )
-        stage_state = np.array(
-            [
-                last_action_norm,
-                recent_novelty,
-                is_speed_stage,
-                0.5 * (legal_move_ratio + legal_flash_ratio),
-            ],
-            dtype=np.float32,
-        )
-        scalar = np.concatenate([hero_state, treasure_state, monster_state, mobility_state, stage_state], axis=0)
-        return scalar
-
-    def _extract_map_passable(self, observation):
-        map_info = np.asarray(observation.get("map_info", np.ones((Config.VIEW_SIZE, Config.VIEW_SIZE))), dtype=np.float32)
-        map_info = self._center_crop_or_pad(map_info, Config.VIEW_SIZE)
-        return np.where(map_info > 0, 1.0, 0.0).astype(np.float32)
-
-    def _extract_hero(self, frame_state):
-        heroes = frame_state.get("heroes", []) if isinstance(frame_state, dict) else []
-        if isinstance(heroes, list) and heroes:
-            return heroes[0]
-        if isinstance(heroes, dict):
-            return heroes
-        return {}
-
-    def _extract_organs(self, frame_state):
-        treasures = []
-        buffs = []
-        debug = {"source": "none"}
-        organ_sources = []
-        if isinstance(frame_state, dict):
-            for key in ("organs", "treasures", "buffs", "items"):
-                raw = frame_state.get(key, [])
-                entities = self._as_entity_list(raw)
-                if entities:
-                    organ_sources.append((key, entities))
-        if not organ_sources:
-            return treasures, buffs, debug
-
-        for source, entities in organ_sources:
-            debug["source"] = source
-            for organ in entities:
-                status = int(self._safe_get(organ, ["status", "alive", "active"], 1))
-                if status not in (1, True):
+    def _compute_flash_escape_scores(self, map_grid, monsters, hero_global, center, flash_landings):
+        hgx, hgz = hero_global
+        cx, cz = center
+        scores = []
+        for (dx, dz, _cnt) in flash_landings:
+            if dx == 0 and dz == 0:
+                scores.append(0)
+                continue
+            land_x = cx + dx
+            land_z = cz + dz
+            dist_map, _ = bfs_mod.local_bfs(map_grid, land_x, land_z)
+            min_dist = Config.BFS_MAX_STEPS
+            has_visible_monster = False
+            for m in monsters:
+                if m is None or int(m.get("is_in_view", 0)) == 0:
                     continue
-                sub_type = int(self._safe_get(organ, ["sub_type", "type", "organ_type"], 0))
-                if source == "treasures" and sub_type == 0:
-                    sub_type = 1
-                elif source == "buffs" and sub_type == 0:
-                    sub_type = 2
-                name = str(self._safe_get(organ, ["name"], "")).lower()
-                if sub_type == 1 or "treasure" in name or "chest" in name or "宝箱" in name:
-                    treasures.append(organ)
-                elif sub_type == 2 or "buff" in name:
-                    buffs.append(organ)
-        return treasures, buffs, debug
+                has_visible_monster = True
+                mpos = m.get("pos", {}) or {}
+                lx = int(mpos.get("x", 0)) - hgx + cx
+                lz = int(mpos.get("z", 0)) - hgz + cz
+                if 0 <= lx < self.view_w and 0 <= lz < self.view_h:
+                    d = int(dist_map[lz, lx])
+                    if d >= 0:
+                        min_dist = min(min_dist, d)
+            scores.append(min_dist if has_visible_monster else 0)
+        return scores
 
-    def _as_entity_list(self, raw):
-        if isinstance(raw, list):
-            return [x for x in raw if isinstance(x, dict)]
-        if isinstance(raw, dict):
-            values = [v for v in raw.values() if isinstance(v, dict)]
-            return values if values else [raw]
-        return []
-
-    def _second_nearest_dist(self, entities, hero_pos):
-        dists = []
-        for entity in entities:
-            pos = self._extract_pos(entity)
-            if pos is None or hero_pos is None:
-                continue
-            dx = int(pos[0] - hero_pos[0])
-            dz = int(pos[1] - hero_pos[1])
-            dists.append(float(abs(dx) + abs(dz)))
-        if len(dists) < 2:
-            return None
-        dists.sort()
-        return dists[1]
-
-    def _extract_monsters(self, frame_state):
-        monsters = frame_state.get("monsters", []) if isinstance(frame_state, dict) else []
-        return monsters if isinstance(monsters, list) else []
-
-    def _update_and_rank_treasures(self, visible_treasures, hero_pos):
-        for mem in self.treasure_memory.values():
-            mem["visible"] = False
-
-        for treasure in visible_treasures:
-            memory_id = self._treasure_memory_id(treasure)
-            pos = self._extract_pos(treasure)
-            if pos is None:
-                continue
-            prev = self.treasure_memory.get(
-                memory_id,
-                {
-                    "memory_id": memory_id,
-                    "last_seen": -1,
-                    "value": 0.0,
-                    "pos": pos,
-                },
-            )
-            prev["pos"] = pos
-            prev["last_seen"] = self.step_no
-            prev["visible"] = True
-            prev["value"] = max(prev.get("value", 0.0), self._treasure_value(treasure))
-            self.treasure_memory[memory_id] = prev
-
-        stale_ids = []
-        for memory_id, mem in self.treasure_memory.items():
-            if self.step_no - int(mem.get("last_seen", -1)) > Config.TREASURE_MEMORY_TTL:
-                stale_ids.append(memory_id)
-        for memory_id in stale_ids:
-            self.treasure_memory.pop(memory_id, None)
-
-        ranked = []
-        for mem in self.treasure_memory.values():
-            mem_pos = mem.get("pos", None)
-            if mem_pos is None or hero_pos is None:
-                rank_dist = 1e6
-            else:
-                rank_dist = float(abs(mem_pos[0] - hero_pos[0]) + abs(mem_pos[1] - hero_pos[1]))
-            ranked.append(
-                {
-                    "memory_id": int(mem.get("memory_id", -1)),
-                    "pos": {
-                        "x": int(mem_pos[0]) if mem_pos is not None else -1,
-                        "z": int(mem_pos[1]) if mem_pos is not None else -1,
-                    },
-                    "rank_dist": rank_dist,
-                    "rank_value": float(mem.get("value", 0.0)),
-                    "visible": 1.0 if bool(mem.get("visible", False)) else 0.0,
-                    "recency": float(self.step_no - int(mem.get("last_seen", -1))),
-                }
-            )
-
-        ranked.sort(
-            key=lambda x: (
-                -x["visible"],
-                -x["rank_value"],
-                x["rank_dist"],
-                x["recency"],
-            )
-        )
-        return ranked[: Config.TREASURE_TARGET_TOPK]
-
-    def _build_treasure_debug_topk(self, ranked_treasures, hero_pos):
-        debug_items = []
-        for treasure in ranked_treasures:
-            pos = self._extract_pos(treasure)
-            if pos is None:
-                continue
-
-            key = (int(pos[0]), int(pos[1]))
-            item = self.treasure_memory.get(key, {})
-            if hero_pos is None:
-                dist = None
-            else:
-                dist = float(abs(pos[0] - hero_pos[0]) + abs(pos[1] - hero_pos[1]))
-
-            debug_items.append(
-                {
-                    "id": int(self._safe_get(treasure, ["organ_id", "id", "treasure_id"], -1)),
-                    "x": int(pos[0]),
-                    "z": int(pos[1]),
-                    "dist": dist,
-                    "seen_count": int(item.get("seen_count", 0)),
-                    "is_new": 1 if int(item.get("seen_count", 0)) <= int(Config.TREASURE_NEW_SEEN_COUNT) else 0,
-                }
-            )
-
-        return debug_items
-
-    def _treasure_memory_id(self, treasure):
-        fixed_id = self._safe_get(treasure, ["organ_id", "id", "treasure_id"], None)
-        if fixed_id is not None:
-            return int(fixed_id)
-        pos = self._extract_pos(treasure)
-        if pos is None:
-            return -1
-        return int(pos[0] * 1000 + pos[1])
-
-    def _treasure_value(self, treasure):
-        score = self._safe_get(treasure, ["score", "value", "reward"], 0.0)
-        try:
-            return float(score)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _entity_layer(self, entities, hero_pos, decay=0.0):
-        layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
-        nearest_dist = None
-        center = Config.VIEW_SIZE // 2
-        for entity in entities:
-            pos = self._extract_pos(entity)
-            if pos is None or hero_pos is None:
-                continue
-            dx = int(pos[0] - hero_pos[0])
-            dz = int(pos[1] - hero_pos[1])
-            ix, iz = center + dx, center + dz
-            if 0 <= ix < Config.VIEW_SIZE and 0 <= iz < Config.VIEW_SIZE:
-                manhattan = float(abs(dx) + abs(dz))
-                nearest_dist = manhattan if nearest_dist is None else min(nearest_dist, manhattan)
-                if decay > 0:
-                    layer[iz, ix] = max(layer[iz, ix], np.exp(-decay * manhattan))
-                else:
-                    layer[iz, ix] = 1.0
-        return layer, nearest_dist
-
-    def _predict_monster_threat(self, monsters, hero_pos):
-        layer = np.zeros((Config.VIEW_SIZE, Config.VIEW_SIZE), dtype=np.float32)
-        if hero_pos is None:
-            return layer
-
-        center = Config.VIEW_SIZE // 2
-        for monster in monsters:
-            monster_id = int(self._safe_get(monster, ["monster_id"], -1))
-            cur_pos = self._extract_pos(monster)
-            if cur_pos is None:
-                continue
-
-            prev_pos = self.prev_monster_positions.get(monster_id, cur_pos)
-            vx = int(cur_pos[0] - prev_pos[0])
-            vz = int(cur_pos[1] - prev_pos[1])
-            pred_pos = (cur_pos[0] + vx, cur_pos[1] + vz)
-
-            dx = int(pred_pos[0] - hero_pos[0])
-            dz = int(pred_pos[1] - hero_pos[1])
-            ix, iz = center + dx, center + dz
-            if 0 <= ix < Config.VIEW_SIZE and 0 <= iz < Config.VIEW_SIZE:
-                dist = float(abs(dx) + abs(dz))
-                layer[iz, ix] = max(layer[iz, ix], np.exp(-0.55 * dist))
-        return layer
-
-    def _update_monster_memory(self, monsters):
-        updated = {}
-        for monster in monsters:
-            monster_id = int(self._safe_get(monster, ["monster_id"], -1))
-            pos = self._extract_pos(monster)
-            if monster_id >= 0 and pos is not None:
-                updated[monster_id] = pos
-        self.prev_monster_positions = updated
-
-    def _extract_pos(self, obj):
-        if not isinstance(obj, dict):
-            return None
-        pos = obj.get("pos", None)
-        if isinstance(pos, dict):
-            x = pos.get("x", None)
-            z = pos.get("z", None)
-            if x is None or z is None:
-                return None
-            return int(x), int(z)
-        return None
-
-    def _corridor_score(self, passable):
-        center = Config.VIEW_SIZE // 2
-        if passable.shape != (Config.VIEW_SIZE, Config.VIEW_SIZE):
-            return 0.0
-        rays = []
-        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            length = 0
-            x, z = center, center
-            while True:
-                x += dx
-                z += dz
-                if not (0 <= x < Config.VIEW_SIZE and 0 <= z < Config.VIEW_SIZE):
-                    break
-                if passable[z, x] <= 0.5:
-                    break
-                length += 1
-            rays.append(length / float(Config.VIEW_SIZE - 1))
-        return float(np.mean(rays))
-
-    def _alive_space_ratio(self, passable):
-        if passable.shape != (Config.VIEW_SIZE, Config.VIEW_SIZE):
-            return 0.0
-        return float(np.mean(passable > 0.5))
-
-    def _extract_legal_action(self, legal_act_raw):
-        if legal_act_raw is None:
-            return [1] * Config.ACTION_NUM
-
-        arr = np.asarray(legal_act_raw, dtype=np.float32).reshape(-1)
-        if arr.size >= Config.ACTION_NUM:
-            if np.all((arr[: Config.ACTION_NUM] == 0) | (arr[: Config.ACTION_NUM] == 1)):
-                mask = arr[: Config.ACTION_NUM]
-            else:
-                valid_set = {int(a) for a in arr if 0 <= int(a) < Config.ACTION_NUM}
-                mask = np.array([1 if i in valid_set else 0 for i in range(Config.ACTION_NUM)], dtype=np.float32)
-        else:
-            mask = np.ones(Config.ACTION_NUM, dtype=np.float32)
-
-        if float(mask.sum()) <= 0:
-            mask = np.ones(Config.ACTION_NUM, dtype=np.float32)
-        return mask.tolist()
-
-    def _apply_obstacle_action_mask(self, legal_action, passable):
-        env_mask = np.asarray(legal_action, dtype=np.float32).reshape(-1)
-        if env_mask.size < Config.ACTION_NUM:
-            pad = np.ones(Config.ACTION_NUM - env_mask.size, dtype=np.float32)
-            env_mask = np.concatenate([env_mask, pad], axis=0)
-        env_mask = env_mask[: Config.ACTION_NUM]
-
-        if not Config.ENABLE_OBSTACLE_ACTION_MASK:
-            return env_mask.tolist()
-
-        move_mask, flash_mask = self._build_obstacle_masks(passable)
-        mode = str(Config.OBSTACLE_MASK_MODE).lower().strip()
-
-        if mode == "hard":
-            merged = env_mask.copy()
-            merged[:8] = merged[:8] * move_mask
-            merged[8:16] = merged[8:16] * flash_mask
-        else:
-            strength = float(np.clip(Config.OBSTACLE_MASK_STRENGTH, 0.0, 1.0))
-            flash_scale = float(np.clip(Config.FLASH_OBSTACLE_MASK_SCALE, 0.0, 1.0))
-
-            merged = env_mask.copy()
-            move_gate = (1.0 - strength) + strength * move_mask
-            flash_gate = (1.0 - strength * flash_scale) + strength * flash_scale * flash_mask
-            merged[:8] = merged[:8] * move_gate
-            merged[8:16] = merged[8:16] * flash_gate
-
-        if float(np.sum(merged)) <= 1e-6:
-            merged = env_mask
-        return merged.tolist()
-
-    def _build_obstacle_masks(self, passable):
-        move_mask = np.ones(8, dtype=np.float32)
-        flash_mask = np.ones(8, dtype=np.float32)
-
-        grid = np.asarray(passable, dtype=np.float32)
-        if grid.ndim != 2:
-            return move_mask, flash_mask
-
-        h, w = grid.shape
-        cz = h // 2
-        cx = w // 2
-
-        dirs = list(getattr(Config, "ACTION_MOVE_DIRS", []))
-        if len(dirs) < 8:
-            dirs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)]
-
-        for i in range(8):
-            dx, dz = int(dirs[i][0]), int(dirs[i][1])
-            nz = cz + dz
-            nx = cx + dx
-            if 0 <= nz < h and 0 <= nx < w:
-                move_mask[i] = 1.0 if grid[nz, nx] > 0.5 else 0.0
-            else:
-                move_mask[i] = 0.0
-
-            fz = cz + 2 * dz
-            fx = cx + 2 * dx
-            if 0 <= fz < h and 0 <= fx < w:
-                near_ok = 1.0 if grid[nz, nx] > 0.5 else 0.0
-                far_ok = 1.0 if grid[fz, fx] > 0.5 else 0.0
-                flash_mask[i] = 1.0 if (near_ok > 0.5 and far_ok > 0.5) else 0.0
-            else:
-                flash_mask[i] = 0.0
-
-        if float(np.sum(move_mask)) <= 1e-6:
-            move_mask[:] = 1.0
-        if float(np.sum(flash_mask)) <= 1e-6:
-            flash_mask[:] = 1.0
-
-        return move_mask, flash_mask
-
-    def _apply_treasure_direction_bias(self, legal_action, hero_pos, target_pos, nearest_monster_dist):
-        arr = np.asarray(legal_action, dtype=np.float32).reshape(-1)
-        if arr.size < Config.ACTION_NUM:
-            pad = np.ones(Config.ACTION_NUM - arr.size, dtype=np.float32)
-            arr = np.concatenate([arr, pad], axis=0)
-        arr = arr[: Config.ACTION_NUM]
-
-        if not Config.ENABLE_TREASURE_DIRECTION_BIAS:
-            return arr.tolist()
-        if hero_pos is None or target_pos is None:
-            return arr.tolist()
-
-        danger = self._danger_level(nearest_monster_dist)
-        if danger >= float(Config.TREASURE_DIRECTION_BIAS_DANGER_GATE):
-            return arr.tolist()
-
-        hx, hz = int(hero_pos[0]), int(hero_pos[1])
-        tx, tz = int(target_pos[0]), int(target_pos[1])
-        base_dist = float(abs(tx - hx) + abs(tz - hz))
-        if base_dist <= 1e-6:
-            return arr.tolist()
-
-        dirs = list(getattr(Config, "ACTION_MOVE_DIRS", []))
-        if len(dirs) < 8:
-            dirs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)]
-
-        improve = np.zeros(8, dtype=np.float32)
-        for i in range(8):
-            dx, dz = int(dirs[i][0]), int(dirs[i][1])
-            nd = float(abs(tx - (hx + dx)) + abs(tz - (hz + dz)))
-            imp = np.clip((base_dist - nd) / max(1.0, base_dist), -1.0, 1.0)
-            improve[i] = imp
-
-        strength = float(np.clip(Config.TREASURE_DIRECTION_BIAS_STRENGTH, 0.0, 1.0))
-        move_gate = 1.0 + strength * np.clip(improve, 0.0, 1.0)
-        flash_gate = 1.0 + 0.7 * strength * np.clip(improve, 0.0, 1.0)
-
-        arr[:8] = arr[:8] * move_gate
-        arr[8:16] = arr[8:16] * flash_gate
-
-        if float(np.sum(arr)) <= 1e-6:
-            return legal_action
-        return arr.tolist()
-
-    def _safe_get(self, obj, keys, default):
-        if not isinstance(obj, dict):
-            return default
-        for key in keys:
-            if key in obj:
-                return obj[key]
-        return default
-
-    def _center_crop_or_pad(self, arr, target_size):
+    def _normalize_map(self, map_info_raw):
+        if map_info_raw is None:
+            return np.ones((Config.MAP_VIEW, Config.MAP_VIEW), dtype=np.int32)
+        arr = np.asarray(map_info_raw, dtype=np.int32)
         if arr.ndim != 2:
-            arr = np.asarray(arr).reshape(-1)
-            side = int(np.sqrt(arr.shape[0]))
-            if side * side == arr.shape[0]:
-                arr = arr.reshape(side, side)
-            else:
-                return np.zeros((target_size, target_size), dtype=np.float32)
+            return np.ones((Config.MAP_VIEW, Config.MAP_VIEW), dtype=np.int32)
+        return (arr != 0).astype(np.int32)
 
-        h, w = arr.shape
-        out = np.zeros((target_size, target_size), dtype=np.float32)
-
-        src_top = max(0, (h - target_size) // 2)
-        src_left = max(0, (w - target_size) // 2)
-        src_bottom = min(h, src_top + target_size)
-        src_right = min(w, src_left + target_size)
-
-        cropped = arr[src_top:src_bottom, src_left:src_right]
-        ch, cw = cropped.shape
-        dst_top = max(0, (target_size - ch) // 2)
-        dst_left = max(0, (target_size - cw) // 2)
-        out[dst_top : dst_top + ch, dst_left : dst_left + cw] = cropped
+    def _build_map_tensor(self, map_grid, treasure_set, buff_set, monsters, hero_gx, hero_gz, cx, cz):
+        h, w = map_grid.shape
+        tensor = np.zeros((Config.MAP_CHANNELS, h, w), dtype=np.float32)
+        tensor[0] = (map_grid == 0).astype(np.float32)
+        for (lx, lz) in treasure_set:
+            tensor[1, lz, lx] = 1.0
+        for (lx, lz) in buff_set:
+            tensor[2, lz, lx] = 1.0
+        for m in monsters:
+            if m is None or int(m.get("is_in_view", 0)) == 0:
+                continue
+            mpos = m.get("pos", {}) or {}
+            lx = int(mpos.get("x", 0)) - hero_gx + cx
+            lz = int(mpos.get("z", 0)) - hero_gz + cz
+            if 0 <= lx < w and 0 <= lz < h:
+                tensor[3, lz, lx] = 1.0
+        tensor[4, cz, cx] = 1.0
+        for i, (gx, gz) in enumerate(reversed(self.trajectory)):
+            decay = 1.0 - i / max(Config.TRAJECTORY_LEN, 1)
+            lx = gx - hero_gx + cx
+            lz = gz - hero_gz + cz
+            if 0 <= lx < w and 0 <= lz < h:
+                tensor[5, lz, lx] = max(tensor[5, lz, lx], decay)
+        if h == Config.MAP_VIEW and w == Config.MAP_VIEW:
+            return tensor
+        out = np.zeros((Config.MAP_CHANNELS, Config.MAP_VIEW, Config.MAP_VIEW), dtype=np.float32)
+        ocx, ocz = Config.MAP_VIEW // 2, Config.MAP_VIEW // 2
+        for zz in range(Config.MAP_VIEW):
+            for xx in range(Config.MAP_VIEW):
+                sx = cx + (xx - ocx)
+                sz = cz + (zz - ocz)
+                if 0 <= sx < w and 0 <= sz < h:
+                    out[:, zz, xx] = tensor[:, sz, sx]
         return out
+
+    def _build_sym_feat(
+        self,
+        hero,
+        env_info,
+        monsters,
+        treasure_local,
+        buff_local,
+        remembered_treasures,
+        hero_global,
+        center,
+        map_grid,
+        hero_dist_map,
+        rays,
+        flash_landings,
+        movable_mask,
+        flash_useful_mask,
+        last_action,
+    ):
+        hgx, hgz = hero_global
+        cx, cz = center
+        h, w = map_grid.shape
+
+        flash_cd = int(hero.get("flash_cooldown", 0))
+        flash_ready = 1.0 if flash_cd <= 0 else 0.0
+        buff_remain = float(hero.get("buff_remaining_time", 0))
+        has_speed_buff = 1.0 if buff_remain > 0 else 0.0
+        hero_feat = np.array(
+            [
+                _norm(hgx, Config.MAP_SIZE),
+                _norm(hgz, Config.MAP_SIZE),
+                _norm(flash_cd, Config.FLASH_COOLDOWN_DEFAULT),
+                flash_ready,
+                _norm(buff_remain, Config.MAX_BUFF_DURATION),
+                has_speed_buff,
+            ],
+            dtype=np.float32,
+        )
+
+        monster_feats = []
+        for mi in range(2):
+            m = monsters[mi]
+            if m is None:
+                monster_feats.append(np.zeros(10, dtype=np.float32))
+                continue
+            is_in_view = int(m.get("is_in_view", 0))
+            mpos = m.get("pos", {}) or {}
+            mx, mz = int(mpos.get("x", 0)), int(mpos.get("z", 0))
+            speed = int(m.get("speed", 1))
+            bucket = int(m.get("hero_l2_distance", 5))
+            dir_e = int(m.get("hero_relative_direction", 0))
+
+            pos_x_norm = 0.0
+            pos_z_norm = 0.0
+            euclid_dist = 1.0
+            bfs_or_bucket = bucket / 5.0
+            delta_dist = 0.0
+
+            if is_in_view:
+                pos_x_norm = _norm(mx, Config.MAP_SIZE)
+                pos_z_norm = _norm(mz, Config.MAP_SIZE)
+                raw = np.hypot(hgx - mx, hgz - mz)
+                euclid_dist = _norm(raw, Config.MAP_SIZE * 1.4143)
+                lx = mx - hgx + cx
+                lz = mz - hgz + cz
+                if 0 <= lx < w and 0 <= lz < h:
+                    d = int(hero_dist_map[lz, lx])
+                    if d >= 0:
+                        bfs_or_bucket = d / float(Config.BFS_MAX_STEPS)
+                last_mp = self.last_monster_pos.get(mi)
+                if last_mp is not None:
+                    delta_dist = np.hypot(hgx - mx, hgz - mz) - np.hypot(hgx - last_mp[0], hgz - last_mp[1])
+                    delta_dist = float(np.clip(delta_dist / 4.0, -1.0, 1.0))
+
+            cos_d, sin_d, unk_d = bfs_mod.bucket_direction_to_cos_sin(dir_e)
+            monster_feats.append(
+                np.array(
+                    [
+                        float(is_in_view),
+                        pos_x_norm,
+                        pos_z_norm,
+                        _norm(speed, Config.MAX_MONSTER_SPEED),
+                        euclid_dist,
+                        bfs_or_bucket,
+                        cos_d,
+                        sin_d,
+                        unk_d,
+                        delta_dist,
+                    ],
+                    dtype=np.float32,
+                )
+            )
+
+        treasure_entries = []
+        for (lx, lz, bucket, dir_e, _st, _gx, _gz) in treasure_local:
+            if 0 <= lx < w and 0 <= lz < h:
+                d = int(hero_dist_map[lz, lx])
+                if d >= 0:
+                    treasure_entries.append((d, bucket, dir_e))
+        treasure_entries.sort(key=lambda t: (t[0], t[1]))
+        treasure_feat = []
+        for i in range(Config.TOP_K_TREASURE):
+            if i < len(treasure_entries):
+                d, _bucket, dir_e = treasure_entries[i]
+                cos_d, sin_d, _unk = bfs_mod.bucket_direction_to_cos_sin(dir_e)
+                treasure_feat.extend([d / float(Config.BFS_MAX_STEPS), cos_d, sin_d])
+            else:
+                treasure_feat.extend([1.0, 0.0, 0.0])
+        treasure_feat = np.array(treasure_feat, dtype=np.float32)
+
+        if buff_local:
+            best = None
+            for (lx, lz, bucket, dir_e, status, _gx, _gz) in buff_local:
+                d = Config.BFS_MAX_STEPS
+                if 0 <= lx < w and 0 <= lz < h:
+                    dd = int(hero_dist_map[lz, lx])
+                    if dd >= 0:
+                        d = dd
+                if best is None or d < best[0]:
+                    best = (d, bucket, dir_e, status)
+            d, bucket, dir_e, status = best
+            dist_norm = d / float(Config.BFS_MAX_STEPS) if d < Config.BFS_MAX_STEPS else bucket / 5.0
+            cos_d, sin_d, _unk = bfs_mod.bucket_direction_to_cos_sin(dir_e)
+            buff_feat = np.array([dist_norm, cos_d, sin_d, float(status == 1)], dtype=np.float32)
+        else:
+            buff_feat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        rays_feat = np.array([r / float(Config.FLASH_RANGE_STRAIGHT) for r in rays], dtype=np.float32)
+
+        flash_feat = []
+        for (dx, dz, cnt) in flash_landings:
+            flash_feat.extend(
+                [
+                    dx / float(Config.FLASH_RANGE_STRAIGHT),
+                    dz / float(Config.FLASH_RANGE_STRAIGHT),
+                    min(cnt, 5) / 5.0,
+                ]
+            )
+        flash_feat = np.array(flash_feat, dtype=np.float32)
+
+        last_oh = np.zeros(16, dtype=np.float32)
+        if last_action is not None and 0 <= int(last_action) < 16:
+            last_oh[int(last_action)] = 1.0
+
+        movable_feat = np.array(movable_mask, dtype=np.float32)
+        flash_useful_feat = np.array(flash_useful_mask, dtype=np.float32)
+        flash_ready_feat = np.array([flash_ready], dtype=np.float32)
+
+        max_monster_speed = 1
+        for m in monsters:
+            if m is None:
+                continue
+            max_monster_speed = max(max_monster_speed, int(m.get("speed", 1)))
+        late_factor = _clip01((max_monster_speed - 1.0) / 1.0)
+        phase_feat = np.array(
+            [
+                max_monster_speed / Config.MAX_MONSTER_SPEED,
+                1.0 if late_factor > 0.5 else 0.0,
+                flash_ready * (1.0 if late_factor > 0.5 else 0.0),
+                _clip01(1.0 - self.step_no / max(self.max_step, 1)),
+            ],
+            dtype=np.float32,
+        )
+
+        total_tre = max(int(env_info.get("total_treasure", 1)), 1)
+        got_tre = int(env_info.get("treasures_collected", 0))
+        progress_feat = np.array(
+            [_norm(self.step_no, self.max_step), got_tre / float(total_tre)],
+            dtype=np.float32,
+        )
+
+        if len(self.position_history) >= Config.POSITION_HISTORY_WINDOW:
+            old_x, old_z = self.position_history[-Config.POSITION_HISTORY_WINDOW]
+            pos10_feat = np.array(
+                [
+                    np.clip((old_x - hgx) / float(Config.FLASH_RANGE_STRAIGHT), -1.0, 1.0),
+                    np.clip((old_z - hgz) / float(Config.FLASH_RANGE_STRAIGHT), -1.0, 1.0),
+                ],
+                dtype=np.float32,
+            )
+        else:
+            pos10_feat = np.zeros(2, dtype=np.float32)
+
+        remembered_feat = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        remembered_candidates = [(tx, tz) for (tx, tz) in remembered_treasures if (tx, tz) != (hgx, hgz)]
+        if remembered_candidates:
+            tx, tz = min(remembered_candidates, key=lambda p: np.hypot(p[0] - hgx, p[1] - hgz))
+            dx = tx - hgx
+            dz = tz - hgz
+            dist = np.hypot(dx, dz)
+            if dist > 1e-6:
+                remembered_feat = np.array(
+                    [
+                        _norm(dist, Config.MAP_SIZE * 1.4143),
+                        float(np.clip(dx / dist, -1.0, 1.0)),
+                        float(np.clip(dz / dist, -1.0, 1.0)),
+                    ],
+                    dtype=np.float32,
+                )
+
+        sym_feat = np.concatenate(
+            [
+                hero_feat,
+                monster_feats[0],
+                monster_feats[1],
+                treasure_feat,
+                buff_feat,
+                rays_feat,
+                flash_feat,
+                last_oh,
+                movable_feat,
+                flash_useful_feat,
+                flash_ready_feat,
+                phase_feat,
+                progress_feat,
+                pos10_feat,
+                remembered_feat,
+            ]
+        ).astype(np.float32)
+        assert sym_feat.shape[0] == Config.SYM_FEATURE_LEN
+
+        blocked = sum(1 for r in rays if r <= Config.DEAD_END_RAY_THRESHOLD)
+        dead_end_score = blocked / 8.0
+        return sym_feat, dead_end_score
+
+    def _parse_env_flash_mask(self, legal_act_raw):
+        if legal_act_raw is None:
+            return [1] * 8
+        if isinstance(legal_act_raw, np.ndarray):
+            legal_act_raw = legal_act_raw.tolist()
+        if not isinstance(legal_act_raw, (list, tuple)) or len(legal_act_raw) == 0:
+            return [1] * 8
+        if isinstance(legal_act_raw[0], (bool, np.bool_, int, np.integer)):
+            if len(legal_act_raw) >= 16:
+                return [int(bool(legal_act_raw[8 + j])) for j in range(8)]
+        return [1] * 8
+
+    def _build_legal_16(self, movable_mask, flash_ready, flash_useful_mask, env_flash_mask):
+        mask = [0] * 16
+        for k in range(8):
+            mask[k] = int(movable_mask[k])
+        if flash_ready:
+            for k in range(8):
+                if env_flash_mask[k] and flash_useful_mask[k]:
+                    mask[8 + k] = 1
+        if sum(mask) == 0 and flash_ready:
+            for k in range(8):
+                if flash_useful_mask[k]:
+                    mask[8 + k] = 1
+        if sum(mask) == 0:
+            mask = [1] * 16
+        return mask
+
+    def _compute_reward(
+        self,
+        picked_treasure,
+        picked_buff,
+        used_flash,
+        flash_path_had_item,
+        monster_bfs_gain,
+        bumped_wall,
+        dead_end,
+        late_factor,
+        nearest_treasure_bfs,
+        min_monster_bfs,
+        first_seen_treasure_count=0,
+        opening_treasure_shield=False,
+        has_unreachable_treasure_in_view=False,
+        is_lingering=False,
+    ):
+        r_treasure = _lerp(Config.R_TREASURE_EARLY, Config.R_TREASURE_LATE, late_factor) if picked_treasure else 0.0
+        r_buff = _lerp(Config.R_BUFF_EARLY, Config.R_BUFF_LATE, late_factor) if picked_buff else 0.0
+        r_survive = _lerp(Config.R_SURVIVE_EARLY, Config.R_SURVIVE_LATE, late_factor)
+        r_first_seen = Config.R_FIRST_SEEN_TREASURE * float(first_seen_treasure_count)
+        r_opening_blind_treasure = (
+            Config.R_OPENING_BLIND_TREASURE if picked_treasure and opening_treasure_shield else 0.0
+        )
+
+        r_flash_path_item = 0.0
+        r_flash_escape = 0.0
+        r_flash_cost = 0.0
+        r_flash_waste = 0.0
+        if used_flash:
+            if flash_path_had_item:
+                r_flash_path_item = Config.R_FLASH_TO_REACH * (1.0 - late_factor)
+            if monster_bfs_gain >= Config.FLASH_ESCAPE_MIN_GAIN:
+                gain_scale = min(monster_bfs_gain / 4.0, 1.5)
+                r_flash_escape = Config.R_FLASH_ESCAPE * late_factor * gain_scale
+            r_flash_cost = Config.R_FLASH_COST_EARLY * (1.0 - late_factor)
+            if late_factor > 0.5 and monster_bfs_gain < Config.FLASH_ESCAPE_MIN_GAIN and not flash_path_had_item:
+                stage = Config.CURRICULUM_STAGE
+                if stage == 3:
+                    r_flash_waste = Config.R_FLASH_WASTE_STAGE3
+                elif stage >= 4:
+                    r_flash_waste = Config.R_FLASH_WASTE_STAGE4
+
+        if bumped_wall and has_unreachable_treasure_in_view:
+            r_bump = Config.R_BUMP_WALL_TOWARD_UNREACHABLE
+        else:
+            r_bump = Config.R_BUMP_WALL if bumped_wall else 0.0
+        r_dead = Config.R_DEAD_END if dead_end else 0.0
+
+        r_monster_proximity = 0.0
+        if min_monster_bfs < Config.MONSTER_DANGER_THRESHOLD:
+            ratio = 1.0 - min_monster_bfs / float(Config.MONSTER_DANGER_THRESHOLD)
+            r_monster_proximity = Config.R_MONSTER_PROXIMITY_COEF * (ratio ** 2)
+
+        r_linger = Config.R_LINGER if is_lingering else 0.0
+
+        n = float(Config.BFS_MAX_STEPS)
+        phi = (
+            Config.POT_ALPHA_TREASURE * (1.0 - min(nearest_treasure_bfs / n, 1.0))
+            + Config.POT_BETA_MONSTER * min(min_monster_bfs / n, 1.0)
+        )
+        r_pot = Config.GAMMA * phi - self.last_potential
+        self.last_potential = phi
+
+        return (
+            r_treasure
+            + r_buff
+            + r_survive
+            + r_first_seen
+            + r_opening_blind_treasure
+            + r_flash_path_item
+            + r_flash_escape
+            + r_flash_cost
+            + r_flash_waste
+            + r_bump
+            + r_dead
+            + r_monster_proximity
+            + r_linger
+            + r_pot
+        )

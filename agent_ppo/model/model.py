@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-Author: Tencent AI Arena Authors
-
-Neural network model for Gorge Chase PPO.
-峡谷追猎 PPO 神经网络模型。
+CNN + MLP dual-branch Actor-Critic for Gorge Chase PPO.
 """
 
 import torch
@@ -23,89 +20,70 @@ def make_fc_layer(in_features, out_features):
     return fc
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.act = nn.SiLU()
-        self.shortcut = None
-        if in_channels != out_channels or stride != 1:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride)
-
-    def forward(self, x):
-        identity = x
-        x = self.act(self.conv1(x))
-        x = self.conv2(x)
-        if self.shortcut is not None:
-            identity = self.shortcut(identity)
-        return self.act(x + identity)
-
-
-class SEGate(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 4, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(channels // 4, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        return x * self.fc(x)
+def make_conv_layer(in_ch, out_ch, kernel=3, stride=1, padding=1):
+    conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel, stride=stride, padding=padding)
+    nn.init.orthogonal_(conv.weight.data)
+    nn.init.zeros_(conv.bias.data)
+    return conv
 
 
 class Model(nn.Module):
-    """Compact residual CNN + scalar fusion + dual-value critic.
-
-    轻量残差 CNN + 标量融合 + 双价值分支 Critic。
-    """
-
     def __init__(self, device=None):
         super().__init__()
-        self.model_name = "gorge_chase_compact_fusion"
+        self.model_name = "gorge_chase_cnn_mlp"
         self.device = device
-        trunk_dim = 128
 
-        self.map_encoder = nn.Sequential(
-            ConvBlock(Config.VIEW_CHANNELS, 16),
-            ConvBlock(16, 32),
-            nn.AdaptiveAvgPool2d((1, 1)),
+        c = Config.MAP_CHANNELS
+        v = Config.MAP_VIEW
+        s = Config.SYM_FEATURE_LEN
+        a = Config.ACTION_NUM
+        vn = Config.VALUE_NUM
+
+        self._map_shape = (c, v, v)
+
+        self.cnn = nn.Sequential(
+            make_conv_layer(c, 16, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            make_conv_layer(16, 32, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            make_conv_layer(32, 32, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
         )
-        self.scalar_encoder = nn.Sequential(
-            make_fc_layer(Config.SCALAR_FEATURE_DIM, 64),
-            nn.SiLU(),
-            make_fc_layer(64, 64),
-            nn.SiLU(),
+
+        self.mlp = nn.Sequential(
+            make_fc_layer(s, 128),
+            nn.ReLU(inplace=True),
+            make_fc_layer(128, 64),
+            nn.ReLU(inplace=True),
         )
 
-        self.shared = nn.Sequential(
-            make_fc_layer(32 + 64, trunk_dim),
-            nn.SiLU(),
-            make_fc_layer(trunk_dim, trunk_dim),
-            nn.SiLU(),
+        fused_dim = 32 + 64
+        self.fusion = nn.Sequential(
+            make_fc_layer(fused_dim, 128),
+            nn.ReLU(inplace=True),
+            make_fc_layer(128, 64),
+            nn.ReLU(inplace=True),
         )
 
-        self.actor_head = make_fc_layer(trunk_dim, Config.ACTION_NUM)
-        self.value_head = make_fc_layer(trunk_dim, Config.VALUE_NUM)
+        self.actor_head = make_fc_layer(64, a)
+        self.critic_head = make_fc_layer(64, vn)
 
-    def forward(self, obs, inference=False):
-        batch_size = obs.shape[0]
-        view_flat_dim = Config.VIEW_CHANNELS * Config.VIEW_SIZE * Config.VIEW_SIZE
+    def _reshape_map(self, map_tensor):
+        if map_tensor.dim() == 2:
+            return map_tensor.view(-1, *self._map_shape)
+        return map_tensor
 
-        view_flat = obs[:, :view_flat_dim]
-        scalar = obs[:, view_flat_dim:]
-
-        view = view_flat.view(batch_size, Config.VIEW_CHANNELS, Config.VIEW_SIZE, Config.VIEW_SIZE)
-        map_feat = self.map_encoder(view).flatten(1)
-
-        scalar_feat = self.scalar_encoder(scalar)
-
-        trunk = self.shared(torch.cat([map_feat, scalar_feat], dim=1))
-        logits = self.actor_head(trunk)
-        value = self.value_head(trunk)
+    def forward(self, map_tensor, sym_feat, inference=False):
+        m = self._reshape_map(map_tensor)
+        cnn_feat = self.cnn(m)
+        mlp_feat = self.mlp(sym_feat)
+        fused = torch.cat([cnn_feat, mlp_feat], dim=1)
+        h = self.fusion(fused)
+        logits = self.actor_head(h)
+        value = self.critic_head(h)
         return logits, value
 
     def set_train_mode(self):

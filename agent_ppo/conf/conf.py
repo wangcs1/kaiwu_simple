@@ -1,127 +1,121 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-Author: Tencent AI Arena Authors
-
 Configuration for Gorge Chase PPO.
-峡谷追猎 PPO 配置。
 """
+
+import os
 
 
 class Config:
-    # Training profile / 训练配置档位
-    SIMPLE_TRAINING_MODE = True
+    MAP_VIEW = 21
+    MAP_CHANNELS = 6
+    MAP_FLAT_LEN = MAP_CHANNELS * MAP_VIEW * MAP_VIEW
 
-    # Observation setting / 观测设置
-    VIEW_SIZE = 9
-    VIEW_CHANNELS = 6  # passable, treasure, buff, monster, danger, visited
-    SCALAR_FEATURE_DIM = 24
-    HERO_FEATURE_DIM = 5
-    TREASURE_FEATURE_DIM = 6
-    MONSTER_FEATURE_DIM = 5
-    MOBILITY_FEATURE_DIM = 4
-    STAGE_FEATURE_DIM = 4
+    SYM_FEATURE_SPLIT = [6, 10, 10, 9, 4, 8, 24, 16, 8, 8, 1, 4, 2, 2, 3]
+    SYM_FEATURE_LEN = sum(SYM_FEATURE_SPLIT)
+    DIM_OF_OBSERVATION = SYM_FEATURE_LEN
 
-    # Feature dimensions / 特征维度
-    FEATURES = [VIEW_CHANNELS * VIEW_SIZE * VIEW_SIZE, SCALAR_FEATURE_DIM]
-    FEATURE_SPLIT_SHAPE = FEATURES
-    FEATURE_LEN = sum(FEATURE_SPLIT_SHAPE)
-    DIM_OF_OBSERVATION = FEATURE_LEN
-
-    # Action space / 动作空间
-    ACTION_NUM = 16  # 0-7 move, 8-15 flash
-
-    # Value head / 价值头
+    ACTION_NUM = 16
     VALUE_NUM = 1
 
-    # PPO hyperparameters / PPO 超参数
-    GAMMA = 0.99
-    LAMDA = 0.95
-    INIT_LEARNING_RATE_START = 0.0003
-    BETA_START = 0.001
+    GAMMA = 0.995
+    LAMDA = 0.97
+    INIT_LEARNING_RATE_START = 3e-4
+    BETA_START = 0.02
+    BETA_END = 0.005
+    BETA_ANNEAL_STEPS = 2_000_000
     CLIP_PARAM = 0.2
     VF_COEF = 1.0
     GRAD_CLIP_RANGE = 0.5
-    PPO_EPOCHS = 4
-    PPO_MINIBATCH_SIZE = 128
-    BETA_END = 0.0002
-    BETA_DECAY_STEPS = 200000
 
-    # Reward shaping / 奖励塑形
-    REWARD_STEP_SURVIVE = 0.006
-    REWARD_STEP_PENALTY = -0.002
-    REWARD_TREASURE_PROGRESS_BASE = 0.06
-    REWARD_TREASURE_PROGRESS_SAFE_GAIN = 0.18
-    REWARD_TREASURE_NEAR_PROGRESS = 0.40
-    REWARD_TREASURE_NEAR_BONUS = 0.16
-    REWARD_TREASURE_PICKUP = 2.0
-    REWARD_BUFF_PICKUP = 0.45
-    REWARD_ESCAPE_PROGRESS_BASE = 0.03
-    REWARD_ESCAPE_PROGRESS_DANGER_GAIN = 0.22
-    REWARD_MONSTER_PROXIMITY_PENALTY = -0.12
-    REWARD_EXPLORATION = 0.006
-    REWARD_STAGNATION_PENALTY = -0.012
-    REWARD_FLASH_ESCAPE = 0.18
-    REWARD_FLASH_WASTE_SAFE = -0.025
-    REWARD_STUCK_PENALTY = -0.03
-    REWARD_REPEAT_ACTION_STUCK = -0.01
+    MAP_SIZE = 128.0
+    MAX_MONSTER_SPEED = 2.0
+    FLASH_RANGE_STRAIGHT = 10
+    FLASH_RANGE_DIAGONAL = 8
+    FLASH_COOLDOWN_DEFAULT = 100
+    MAX_BUFF_DURATION = 50.0
+    BFS_MAX_STEPS = 42
 
-    # Final reward = (1 - REWARD_ENV_MIX) * shaped + REWARD_ENV_MIX * env_reward
-    REWARD_ENV_MIX = 0.2
-
-    # Obstacle-aware action mask / 障碍物动作掩码
-    ENABLE_OBSTACLE_ACTION_MASK = True
-    # soft: attenuate blocked actions, hard: directly mask blocked actions
-    OBSTACLE_MASK_MODE = "soft"
-    OBSTACLE_MASK_STRENGTH = 0.65
-    FLASH_OBSTACLE_MASK_SCALE = 0.6
-    # Action direction offsets for actions 0..7 (dx, dz), configured for quick remap if env differs.
-    ACTION_MOVE_DIRS = [
-        (-1, 0),
-        (1, 0),
+    DIR_OFFSETS = [
+        (+1, 0),
+        (+1, -1),
         (0, -1),
-        (0, 1),
         (-1, -1),
-        (1, -1),
-        (-1, 1),
-        (1, 1),
+        (-1, 0),
+        (-1, +1),
+        (0, +1),
+        (+1, +1),
+    ]
+    FLASH_DISTANCES = [
+        FLASH_RANGE_STRAIGHT,
+        FLASH_RANGE_DIAGONAL,
+        FLASH_RANGE_STRAIGHT,
+        FLASH_RANGE_DIAGONAL,
+        FLASH_RANGE_STRAIGHT,
+        FLASH_RANGE_DIAGONAL,
+        FLASH_RANGE_STRAIGHT,
+        FLASH_RANGE_DIAGONAL,
     ]
 
-    DANGER_DISTANCE = 3.0
-    TREASURE_NEAR_RADIUS = 3.0
-    EXPLORATION_DECAY = 0.92
-    STAGNATION_STEPS = 8
-    STUCK_STEPS = 3
+    TOP_K_TREASURE = 3
+    TOP_K_BUFF = 1
 
-    # Monster acceleration phase / 怪物加速阶段
-    MONSTER_ACCEL_STEP = 500
-    ESCAPE_WEIGHT_AFTER_ACCEL = 1.25
-    MONSTER_PENALTY_AFTER_ACCEL = 1.20
+    TRAJECTORY_LEN = 10
+    POSITION_HISTORY_WINDOW = 10
 
-    # Treasure top-k tracking / 宝箱 top-k 追踪
-    TREASURE_TARGET_TOPK = 1
-    TREASURE_MEMORY_TTL = 12
-    TREASURE_NEW_SEEN_COUNT = 1
-    TREASURE_RANK_NEW_BONUS = 1.2
-    TREASURE_RANK_DIST_WEIGHT = 0.10
-    TREASURE_RANK_RISK_WEIGHT = 0.14
-    TREASURE_RANK_RECENCY_WEIGHT = 0.04
-    TREASURE_RANK_VALUE_WEIGHT = 0.02
+    R_TREASURE_EARLY = 2.0
+    R_BUFF_EARLY = 0.5
+    R_FLASH_TO_REACH = 0.3
+    R_FLASH_COST_EARLY = -0.02
+    R_SURVIVE_EARLY = 0.005
 
-    # Direct target-seeking shaping / 目标直追奖励
-    REWARD_TARGET_TRACK_PROGRESS = 0.22
-    REWARD_TARGET_TRACK_AWAY_PENALTY = -0.08
-    REWARD_TARGET_LOCK_BONUS = 0.04
-    REWARD_SIMPLE_TARGET_PROGRESS = 0.30
-    REWARD_SIMPLE_TARGET_AWAY_PENALTY = -0.12
-    REWARD_SIMPLE_DANGER_PENALTY = -0.10
-    REWARD_SIMPLE_ESCAPE_PROGRESS = 0.06
-    REWARD_SIMPLE_STAGNATION = -0.02
+    R_TREASURE_LATE = 1.0
+    R_BUFF_LATE = 0.3
+    R_FLASH_ESCAPE = 0.8
+    R_FLASH_WASTE_STAGE3 = -0.05
+    R_FLASH_WASTE_STAGE4 = -0.25
+    R_SURVIVE_LATE = 0.02
+    R_FIRST_SEEN_TREASURE = 0.06
+    R_OPENING_BLIND_TREASURE = -0.25
 
-    # Treasure direction action bias / 朝宝箱方向动作偏置
-    ENABLE_TREASURE_DIRECTION_BIAS = True
-    TREASURE_DIRECTION_BIAS_STRENGTH = 0.35
-    TREASURE_DIRECTION_BIAS_DANGER_GATE = 0.72
+    R_BUMP_WALL = -0.1
+    R_DEAD_END = -0.05
+    R_WIN = 10.0
+    R_FAIL = -10.0
+    R_SCORE_SHAPED_COEF = 0.01
+
+    POT_ALPHA_TREASURE = 0.3
+    POT_BETA_MONSTER = 0.2
+
+    MONSTER_DANGER_THRESHOLD = 6
+    R_MONSTER_PROXIMITY_COEF = -0.35
+
+    R_BUMP_WALL_TOWARD_UNREACHABLE = -0.3
+
+    LINGER_STEP_LIMIT = 300
+    LINGER_WINDOW = 10
+    LINGER_L2_THRESHOLD = 5.0
+    R_LINGER = -0.10
+
+    OPENING_TREASURE_SHIELD_STEPS = 12
+    OPENING_TREASURE_MONSTER_SAFE_DIST = 8
+
+    RULE_ADJACENT_TREASURE = True
+    RULE_PANIC_FLASH = True
+    PANIC_FLASH_THRESHOLD_EARLY = 2
+    PANIC_FLASH_THRESHOLD_LATE = 4
+    CHASE_FLASH_THRESHOLD_LATE = 6
+    FLASH_ESCAPE_MIN_GAIN = 2
+
+    DEAD_END_RAY_THRESHOLD = 2
+    DEAD_END_RATIO_THRESHOLD = 0.6
+
+    CURRICULUM_AUTO = True
+    STAGE_EPISODE_THRESHOLDS = [0, 2500, 5500]
+    CURRICULUM_LOG_EVERY = 1
+    CURRICULUM_STAGE_OVERRIDE = int(os.environ.get("CURRICULUM_STAGE_OVERRIDE", "0"))
+    CURRICULUM_STAGE = 1

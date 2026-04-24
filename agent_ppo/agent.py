@@ -4,10 +4,14 @@
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
-Author: Tencent AI Arena Authors
+Agent for Gorge Chase PPO (refactored).
 
-Agent class for Gorge Chase PPO.
-峡谷追猎 PPO Agent 主类。
+峡谷追猎 PPO Agent 主类（重构版）。
+
+关键变更：
+  - ObsData 携带双观测 (map_tensor, sym_feat) 与 rule_hints
+  - predict 末尾调用 rules.apply_rule_override（保留 RL 采样 prob 不变，避免 PPO ratio 失真）
+  - _run_model 拆包两输入
 """
 
 import torch
@@ -16,12 +20,14 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 import numpy as np
+
 from kaiwudrl.interface.agent import BaseAgent
 
 from agent_ppo.algorithm.algorithm import Algorithm
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import ActData, ObsData
 from agent_ppo.feature.preprocessor import Preprocessor
+from agent_ppo.feature.rules import apply_rule_override
 from agent_ppo.model.model import Model
 
 
@@ -37,152 +43,157 @@ class Agent(BaseAgent):
             eps=1e-8,
         )
         self.algorithm = Algorithm(self.model, self.optimizer, self.device, logger, monitor)
-        self.preprocessor = Preprocessor(treasure_topk=Config.TREASURE_TARGET_TOPK)
+        self.preprocessor = Preprocessor()
         self.last_action = -1
         self.logger = logger
         self.monitor = monitor
+        self.rule_override_count = 0
         super().__init__(agent_type, device, logger, monitor)
 
+    # ----------------------------------------------------------------
+    # Episode lifecycle
+    # ----------------------------------------------------------------
     def reset(self, env_obs=None):
-        """Reset per-episode state.
-
-        每局开始时重置状态。
-        """
         self.preprocessor.reset()
         self.last_action = -1
+        self.rule_override_count = 0
 
+    # ----------------------------------------------------------------
+    # Observation pipeline
+    # ----------------------------------------------------------------
     def observation_process(self, env_obs):
-        """Convert raw env_obs to ObsData and remain_info.
-
-        将原始观测转换为 ObsData 和 remain_info。
-        """
-        feature, legal_action, reward = self.preprocessor.feature_process(env_obs, self.last_action)
+        feat_dict = self.preprocessor.feature_process(env_obs, self.last_action)
         obs_data = ObsData(
-            feature=list(feature),
-            legal_action=legal_action,
+            map_tensor=feat_dict["map_tensor"],       # (C, H, W) float32
+            sym_feat=feat_dict["sym_feat"],           # (SYM_FEATURE_LEN,) float32
+            legal_action=feat_dict["legal_action_16d"],
+            rule_hints=feat_dict["rule_hints"],
         )
         remain_info = {
-            "reward": reward,
-            "treasure_target_dist": self.preprocessor.current_target_dist,
+            "reward": feat_dict["reward"],
+            "wall_bump_count": self.preprocessor.wall_bump_count,
         }
         return obs_data, remain_info
 
+    # ----------------------------------------------------------------
+    # Inference (stochastic / greedy)
+    # ----------------------------------------------------------------
     def predict(self, list_obs_data):
-        """Stochastic inference for training (exploration).
+        obs_data = list_obs_data[0]
+        logits_np, value_np, prob = self._run_model(
+            obs_data.map_tensor, obs_data.sym_feat, obs_data.legal_action
+        )
 
-        训练时随机采样动作（探索）。
-        """
-        feature = list_obs_data[0].feature
-        legal_action = list_obs_data[0].legal_action
-
-        logits, value, prob = self._run_model(feature, legal_action)
-
-        action = self._legal_sample(prob, use_max=False)
+        rl_action = self._legal_sample(prob, use_max=False)
         d_action = self._legal_sample(prob, use_max=True)
 
-        return [
-            ActData(
-                action=[action],
-                d_action=[d_action],
-                prob=list(prob),
-                value=value,
-            )
-        ]
+        # 规则接管（只替换执行动作，不改 prob）
+        final_action, overridden = apply_rule_override(
+            rl_action, obs_data.legal_action, obs_data.rule_hints
+        )
+        if overridden:
+            self.rule_override_count += 1
+
+        return [ActData(
+            action=[final_action],
+            d_action=[d_action],
+            prob=list(prob),
+            value=value_np,
+            rl_action=[rl_action],
+        )]
 
     def exploit(self, env_obs):
-        """Greedy inference for evaluation.
-
-        评估时贪心选择动作（利用）。
-        """
         obs_data, _ = self.observation_process(env_obs)
-        act_data = self.predict([obs_data])
-        return self.action_process(act_data[0], is_stochastic=False)
+        _, _, prob = self._run_model(
+            obs_data.map_tensor, obs_data.sym_feat, obs_data.legal_action
+        )
+        d_action = self._legal_sample(prob, use_max=True)
+        # 评估时也允许规则接管
+        final_action, overridden = apply_rule_override(
+            d_action, obs_data.legal_action, obs_data.rule_hints
+        )
+        self.last_action = int(final_action)
+        return int(final_action)
 
+    # ----------------------------------------------------------------
+    # Training
+    # ----------------------------------------------------------------
     def learn(self, list_sample_data):
-        """Train the model.
-
-        训练模型。
-        """
         return self.algorithm.learn(list_sample_data)
 
+    # ----------------------------------------------------------------
+    # Checkpoint
+    # ----------------------------------------------------------------
     def save_model(self, path=None, id="1"):
-        """Save model checkpoint.
-
-        保存模型检查点。
-        """
         model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
         state_dict_cpu = {k: v.clone().cpu() for k, v in self.model.state_dict().items()}
         torch.save(state_dict_cpu, model_file_path)
-        self.logger.info(f"save model {model_file_path} successfully")
+        if self.logger:
+            self.logger.info(f"save model {model_file_path} successfully")
 
     def load_model(self, path=None, id="1"):
-        """Load model checkpoint.
-
-        加载模型检查点。
-        """
         model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
         try:
-            ckpt = torch.load(model_file_path, map_location=self.device)
-            model_state = self.model.state_dict()
-            compatible = {
-                k: v
-                for k, v in ckpt.items()
-                if k in model_state and hasattr(v, "shape") and hasattr(model_state[k], "shape") and v.shape == model_state[k].shape
-            }
-            model_state.update(compatible)
-            self.model.load_state_dict(model_state)
-            self.logger.info(
-                f"load model {model_file_path} partially: matched {len(compatible)}/{len(model_state)} params"
+            self.model.load_state_dict(
+                torch.load(model_file_path, map_location=self.device)
             )
-        except Exception as e:
-            self.logger.warning(f"load model failed for {model_file_path}, train from scratch. err={e}")
+            if self.logger:
+                self.logger.info(f"load model {model_file_path} successfully")
+        except FileNotFoundError:
+            if self.logger:
+                self.logger.warning(f"ckpt {model_file_path} not found, keeping random init")
 
+    # ----------------------------------------------------------------
+    # Action unpacking
+    # ----------------------------------------------------------------
     def action_process(self, act_data, is_stochastic=True):
-        """Unpack ActData to int action and update last_action.
-
-        解包 ActData 为 int 动作并记录 last_action。
-        """
         action = act_data.action if is_stochastic else act_data.d_action
         self.last_action = int(action[0])
         return int(action[0])
 
-    def _run_model(self, feature, legal_action):
-        """Run model inference, return logits, value, prob.
-
-        执行模型推理，返回 logits、value 和动作概率。
-        """
+    # ----------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------
+    def _run_model(self, map_tensor, sym_feat, legal_action):
         self.model.set_eval_mode()
-        obs_tensor = torch.tensor(np.array([feature]), dtype=torch.float32).to(self.device)
+        map_t = torch.tensor(np.asarray(map_tensor)[None], dtype=torch.float32).to(self.device)
+        sym_t = torch.tensor(np.asarray(sym_feat)[None], dtype=torch.float32).to(self.device)
 
         with torch.no_grad():
-            logits, value = self.model(obs_tensor, inference=True)
+            logits, value = self.model(map_t, sym_t, inference=True)
 
         logits_np = logits.cpu().numpy()[0]
         value_np = value.cpu().numpy()[0]
 
-        # Legal action masked softmax / 合法动作掩码 softmax
-        legal_action_np = np.array(legal_action, dtype=np.float32)
-        prob = self._legal_soft_max(logits_np, legal_action_np)
-
+        legal_np = np.asarray(legal_action, dtype=np.float32)
+        prob = self._legal_soft_max(logits_np, legal_np)
         return logits_np, value_np, prob
 
-    def _legal_soft_max(self, input_hidden, legal_action):
-        """Softmax with legal action masking (numpy).
+    def estimate_value(self, obs_data):
+        _, value_np, _ = self._run_model(
+            obs_data.map_tensor, obs_data.sym_feat, obs_data.legal_action
+        )
+        return np.array(value_np, dtype=np.float32).flatten()[:1]
 
-        合法动作掩码下的 softmax（numpy 版）。
-        """
-        _w, _e = 1e20, 1e-5
-        tmp = input_hidden - _w * (1.0 - legal_action)
-        tmp_max = np.max(tmp, keepdims=True)
-        tmp = np.clip(tmp - tmp_max, -_w, 1)
-        tmp = (np.exp(tmp) + _e) * legal_action
-        return tmp / (np.sum(tmp, keepdims=True) * 1.00001)
+    def _legal_soft_max(self, logits, legal_action):
+        """Masked softmax (numpy, numerically stable)."""
+        neg_inf = -1e9
+        masked = np.where(legal_action > 0.5, logits, neg_inf)
+        m = np.max(masked)
+        exp = np.exp(masked - m) * (legal_action > 0.5).astype(np.float32)
+        total = exp.sum()
+        if total <= 0:
+            # 极端兜底：若 legal_action 全 0，平均分布
+            return np.ones_like(logits, dtype=np.float32) / float(len(logits))
+        return exp / total
 
     def _legal_sample(self, probs, use_max=False):
-        """Sample action from probability distribution.
-
-        按概率分布采样动作。
-        """
+        probs = np.asarray(probs, dtype=np.float64)
         if use_max:
             return int(np.argmax(probs))
+        # 归一化，multinomial 对舍入容忍度较低
+        s = probs.sum()
+        if s <= 0:
+            return int(np.argmax(probs))
+        probs = probs / s
         return int(np.argmax(np.random.multinomial(1, probs, size=1)))
